@@ -102,8 +102,8 @@ user_settings = {}
 # Словарь для хранения режимов пользователей
 user_modes = {}
 
-# Словарь для хранения состояния кнопок
-user_keyboard_state = {}
+# Словарь для хранения состояния (в меню или в диалоге)
+user_state = {}
 
 # Доступные модели
 AVAILABLE_MODELS = {
@@ -188,6 +188,15 @@ async def safe_send_message(update: Update, text: str, reply_markup=None, parse_
         else:
             await update.message.reply_text(clean_text)
 
+def get_mode_name(mode):
+    """Получить название режима"""
+    names = {
+        "normal": "😊 Обычный",
+        "rude": "😈 Хам",
+        "mat": "🤬 С МАТОМ"
+    }
+    return names.get(mode, mode)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user_id = update.effective_user.id
@@ -205,14 +214,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_modes:
         user_modes[user_id] = DEFAULT_MODE
     
-    # Инициализируем историю с правильным системным промптом
+    # Инициализируем историю
     if user_id not in user_conversations:
         user_conversations[user_id] = [
             {"role": "system", "content": SYSTEM_PROMPTS[user_modes[user_id]]}
         ]
     
-    # Показываем клавиатуру
-    await user_keyboard_state.update({user_id: "main"})
+    # Устанавливаем состояние в меню
+    user_state[user_id] = "menu"
     
     start_text = (
         f"👋 Привет, {user_name}! Я бот на основе ChatGPT.\n"
@@ -222,28 +231,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await safe_send_message(update, start_text, reply_markup=get_main_keyboard())
 
-def get_mode_name(mode):
-    """Получить название режима"""
-    names = {
-        "normal": "😊 Обычный",
-        "rude": "😈 Хам",
-        "mat": "🤬 С МАТОМ"
-    }
-    return names.get(mode, mode)
-
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на кнопки под строкой ввода"""
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главный обработчик всех сообщений"""
     user_id = update.effective_user.id
     text = update.message.text
     
-    # Получаем текущее состояние кнопок
-    current_state = user_keyboard_state.get(user_id, "main")
+    # Пропускаем команды
+    if text.startswith('/'):
+        return
     
-    # Главное меню
-    if current_state == "main":
+    # Получаем состояние пользователя
+    state = user_state.get(user_id, "menu")
+    
+    # Обработка кнопок меню
+    if state == "menu":
         if text == "💬 Задать вопрос":
+            user_state[user_id] = "chat"
             await safe_send_message(update, "Отправь мне свой вопрос, и я отвечу! ✍️", reply_markup=ReplyKeyboardRemove())
-            user_keyboard_state[user_id] = "chat"
             return
         
         elif text == "🧹 Очистить историю":
@@ -254,66 +258,66 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         elif text == "⚙️ Настройки":
-            await show_settings(update, context)
-            user_keyboard_state[user_id] = "settings"
+            await show_settings(update)
+            user_state[user_id] = "settings"
             return
         
         elif text == "📊 Статистика":
-            await show_stats(update, context)
+            await show_stats(update)
             return
         
         elif text == "ℹ️ О боте":
-            await show_about(update, context)
+            await show_about(update)
             return
         
         elif text == "🎭 Режимы":
-            await show_modes(update, context)
-            user_keyboard_state[user_id] = "modes"
+            await show_modes(update)
+            user_state[user_id] = "modes"
             return
     
-    # Меню настроек
-    elif current_state == "settings":
+    # Обработка настроек
+    elif state == "settings":
         if text == "🤖 Сменить модель":
             await safe_send_message(update, "Выбери модель:", reply_markup=get_model_keyboard())
-            user_keyboard_state[user_id] = "model"
+            user_state[user_id] = "model_select"
             return
         
         elif text == "🎭 Сменить режим":
             await safe_send_message(update, "Выбери режим общения:", reply_markup=get_mode_keyboard())
-            user_keyboard_state[user_id] = "mode_select"
+            user_state[user_id] = "mode_select"
             return
         
         elif text == "🌡️ Температура":
             current_temp = user_settings.get(user_id, {}).get('temperature', 0.7)
             await safe_send_message(update, 
                 f"🌡️ Текущая температура: {current_temp}\n"
-                "Введи новое значение от 0 до 2\n"
-                "(чем выше, тем креативнее ответы)",
+                f"Введи новое значение от 0 до 2\n"
+                f"(чем выше, тем креативнее ответы)",
                 reply_markup=ReplyKeyboardRemove())
-            user_keyboard_state[user_id] = "temp_set"
+            user_state[user_id] = "temp_set"
             return
         
         elif text == "📏 Max tokens":
             current_tokens = user_settings.get(user_id, {}).get('max_tokens', 1000)
             await safe_send_message(update,
                 f"📏 Текущий max tokens: {current_tokens}\n"
-                "Введи новое значение от 100 до 4000",
+                f"Введи новое значение от 100 до 4000",
                 reply_markup=ReplyKeyboardRemove())
-            user_keyboard_state[user_id] = "tokens_set"
+            user_state[user_id] = "tokens_set"
             return
         
         elif text == "🌐 Язык":
             await safe_send_message(update, "Выбери язык:", reply_markup=get_language_keyboard())
-            user_keyboard_state[user_id] = "lang"
+            user_state[user_id] = "lang_select"
             return
         
         elif text == "◀️ Назад в меню":
+            user_state[user_id] = "menu"
             await safe_send_message(update, "Главное меню:", reply_markup=get_main_keyboard())
-            user_keyboard_state[user_id] = "main"
             return
     
-    # Меню выбора модели
-    elif current_state == "model":
+    # Обработка выбора модели
+    elif state == "model_select":
         model_map = {
             "GPT-3.5 Turbo": "gpt3",
             "GPT-4": "gpt4",
@@ -334,41 +338,48 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await safe_send_message(update, f"✅ Модель изменена на {text}\nИстория диалога очищена.", 
                                    reply_markup=get_settings_keyboard())
-            user_keyboard_state[user_id] = "settings"
+            user_state[user_id] = "settings"
             return
         
         elif text == "◀️ Назад":
             await safe_send_message(update, "Настройки:", reply_markup=get_settings_keyboard())
-            user_keyboard_state[user_id] = "settings"
+            user_state[user_id] = "settings"
             return
     
-    # Меню выбора режима
-    elif current_state == "mode_select":
+    # Обработка выбора режима
+    elif state == "mode_select":
         if text == "😊 Обычный режим":
-            await mode_normal(update, context)
-            await safe_send_message(update, "Настройки:", reply_markup=get_settings_keyboard())
-            user_keyboard_state[user_id] = "settings"
+            user_modes[user_id] = "normal"
+            if user_id in user_conversations:
+                user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["normal"]}
+            await safe_send_message(update, "✅ Переключено в обычный режим", reply_markup=get_settings_keyboard())
+            user_state[user_id] = "settings"
             return
         
         elif text == "😈 Режим хама":
-            await mode_rude(update, context)
-            await safe_send_message(update, "Настройки:", reply_markup=get_settings_keyboard())
-            user_keyboard_state[user_id] = "settings"
+            user_modes[user_id] = "rude"
+            if user_id in user_conversations:
+                user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["rude"]}
+            await safe_send_message(update, "✅ Переключено в режим хама", reply_markup=get_settings_keyboard())
+            user_state[user_id] = "settings"
             return
         
         elif text == "🤬 РЕЖИМ С МАТОМ (18+)":
-            await mode_mat(update, context)
-            await safe_send_message(update, "Настройки:", reply_markup=get_settings_keyboard())
-            user_keyboard_state[user_id] = "settings"
+            user_modes[user_id] = "mat"
+            if user_id in user_conversations:
+                user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["mat"]}
+            await safe_send_message(update, "⚠️ **ВНИМАНИЕ! РЕЖИМ С МАТОМ АКТИВИРОВАН!**", 
+                                   reply_markup=get_settings_keyboard(), parse_mode='Markdown')
+            user_state[user_id] = "settings"
             return
         
         elif text == "◀️ Назад":
             await safe_send_message(update, "Настройки:", reply_markup=get_settings_keyboard())
-            user_keyboard_state[user_id] = "settings"
+            user_state[user_id] = "settings"
             return
     
-    # Меню выбора языка
-    elif current_state == "lang":
+    # Обработка выбора языка
+    elif state == "lang_select":
         lang_map = {
             "Русский": "ru",
             "English": "en"
@@ -379,23 +390,16 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_settings[user_id] = {}
             user_settings[user_id]["language"] = lang_map[text]
             await safe_send_message(update, f"✅ Язык изменен на {text}", reply_markup=get_settings_keyboard())
-            user_keyboard_state[user_id] = "settings"
+            user_state[user_id] = "settings"
             return
         
         elif text == "◀️ Назад":
             await safe_send_message(update, "Настройки:", reply_markup=get_settings_keyboard())
-            user_keyboard_state[user_id] = "settings"
-            return
-    
-    # Меню режимов (информация)
-    elif current_state == "modes":
-        if text == "◀️ Назад":
-            await safe_send_message(update, "Главное меню:", reply_markup=get_main_keyboard())
-            user_keyboard_state[user_id] = "main"
+            user_state[user_id] = "settings"
             return
     
     # Обработка ввода температуры
-    elif current_state == "temp_set":
+    elif state == "temp_set":
         try:
             temp = float(text)
             if 0 <= temp <= 2:
@@ -404,7 +408,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_settings[user_id]["temperature"] = temp
                 await safe_send_message(update, f"✅ Температура изменена на {temp}", 
                                        reply_markup=get_settings_keyboard())
-                user_keyboard_state[user_id] = "settings"
+                user_state[user_id] = "settings"
             else:
                 await safe_send_message(update, "❌ Температура должна быть от 0 до 2. Попробуй еще раз:")
         except ValueError:
@@ -412,7 +416,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Обработка ввода max tokens
-    elif current_state == "tokens_set":
+    elif state == "tokens_set":
         try:
             tokens = int(text)
             if 100 <= tokens <= 4000:
@@ -421,14 +425,103 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_settings[user_id]["max_tokens"] = tokens
                 await safe_send_message(update, f"✅ Max tokens изменен на {tokens}", 
                                        reply_markup=get_settings_keyboard())
-                user_keyboard_state[user_id] = "settings"
+                user_state[user_id] = "settings"
             else:
                 await safe_send_message(update, "❌ Max tokens должен быть от 100 до 4000. Попробуй еще раз:")
         except ValueError:
             await safe_send_message(update, "❌ Пожалуйста, введите число. Попробуй еще раз:")
         return
+    
+    # Обработка режимов (информация)
+    elif state == "modes":
+        if text == "◀️ Назад":
+            user_state[user_id] = "menu"
+            await safe_send_message(update, "Главное меню:", reply_markup=get_main_keyboard())
+            return
+    
+    # Если мы в режиме чата - обрабатываем как вопрос к боту
+    if state == "chat":
+        await process_question(update, context, user_id, text)
 
-async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, question: str):
+    """Обработка вопроса к боту"""
+    
+    # Обновляем статистику
+    if user_id not in user_stats:
+        user_stats[user_id] = {
+            "messages": 0,
+            "first_seen": datetime.now(),
+            "last_active": datetime.now()
+        }
+    
+    user_stats[user_id]["messages"] += 1
+    user_stats[user_id]["last_active"] = datetime.now()
+    
+    # Получаем текущий режим
+    current_mode = user_modes.get(user_id, DEFAULT_MODE)
+    mode_stats[current_mode] = mode_stats.get(current_mode, 0) + 1
+    
+    # Проверяем пустое сообщение
+    if not question.strip():
+        if current_mode == "mat":
+            await safe_send_message(update, "Слышь, ёбаный гений, ты че пустые сообщения шлешь? Совсем охренел? Напиши нормально, мудак!")
+        elif current_mode == "rude":
+            await safe_send_message(update, "Слушай, гений, ты вообще сообщение собираешься писать? Пустые сообщения - это новый вид искусства?")
+        else:
+            await safe_send_message(update, "Пожалуйста, отправьте непустое сообщение.")
+        return
+    
+    # Показываем, что бот печатает
+    await update.message.chat.send_action(action="typing")
+    
+    try:
+        # Получаем историю
+        if user_id not in user_conversations:
+            user_conversations[user_id] = [
+                {"role": "system", "content": SYSTEM_PROMPTS[current_mode]}
+            ]
+        
+        # Добавляем вопрос
+        user_conversations[user_id].append({"role": "user", "content": question})
+        
+        # Ограничиваем историю
+        if len(user_conversations[user_id]) > 11:
+            user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-10:]
+        
+        # Получаем ответ
+        bot_response, error = await ask_openrouter(user_conversations[user_id], user_id)
+        
+        if error:
+            await safe_send_message(update, error, reply_markup=get_main_keyboard())
+            user_conversations[user_id].pop()
+            user_state[user_id] = "menu"
+            return
+        
+        # Добавляем ответ в историю
+        user_conversations[user_id].append({"role": "assistant", "content": bot_response})
+        
+        # Отправляем ответ
+        if len(bot_response) > 4096:
+            for x in range(0, len(bot_response), 4096):
+                await safe_send_message(update, bot_response[x:x+4096], reply_markup=get_main_keyboard())
+        else:
+            await safe_send_message(update, bot_response, reply_markup=get_main_keyboard())
+        
+        # Возвращаемся в меню
+        user_state[user_id] = "menu"
+        
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        if current_mode == "mat":
+            error_message = "🤬 Пиздец, ошибка какая-то! Даже мой отборный мат не помог! Попробуй позже, мудак!"
+        elif current_mode == "rude":
+            error_message = "❌ Ошибка! Даже мой сарказм не помог. Попробуй позже."
+        else:
+            error_message = "❌ Произошла ошибка. Попробуйте позже."
+        await safe_send_message(update, error_message, reply_markup=get_main_keyboard())
+        user_state[user_id] = "menu"
+
+async def show_settings(update: Update):
     """Показать настройки"""
     user_id = update.effective_user.id
     
@@ -457,7 +550,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await safe_send_message(update, settings_text, reply_markup=get_settings_keyboard(), parse_mode='Markdown')
 
-async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_stats(update: Update):
     """Показать статистику"""
     user_id = update.effective_user.id
     
@@ -489,7 +582,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_send_message(update, "Статистика пока отсутствует", reply_markup=get_main_keyboard())
 
-async def show_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_about(update: Update):
     """Показать информацию о боте"""
     about_text = f"""
 🤖 **О БОТЕ**
@@ -512,7 +605,7 @@ async def show_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await safe_send_message(update, about_text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
-async def show_modes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_modes(update: Update):
     """Показать информацию о режимах"""
     user_id = update.effective_user.id
     current_mode = user_modes.get(user_id, DEFAULT_MODE)
@@ -543,220 +636,6 @@ async def show_modes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     
     await safe_send_message(update, mode_text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
-
-async def mode_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переключение в обычный режим"""
-    user_id = update.effective_user.id
-    user_modes[user_id] = "normal"
-    
-    if user_id in user_conversations and user_conversations[user_id]:
-        user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["normal"]}
-    else:
-        user_conversations[user_id] = [{"role": "system", "content": SYSTEM_PROMPTS["normal"]}]
-    
-    await safe_send_message(update, "✅ Переключено в обычный режим")
-
-async def mode_rude(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переключение в режим хама"""
-    user_id = update.effective_user.id
-    user_modes[user_id] = "rude"
-    
-    if user_id in user_conversations and user_conversations[user_id]:
-        user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["rude"]}
-    else:
-        user_conversations[user_id] = [{"role": "system", "content": SYSTEM_PROMPTS["rude"]}]
-    
-    await safe_send_message(update, "✅ Переключено в режим хама")
-
-async def mode_mat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переключение в режим с матом"""
-    user_id = update.effective_user.id
-    user_modes[user_id] = "mat"
-    
-    if user_id in user_conversations and user_conversations[user_id]:
-        user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["mat"]}
-    else:
-        user_conversations[user_id] = [{"role": "system", "content": SYSTEM_PROMPTS["mat"]}]
-    
-    await safe_send_message(update, "⚠️ **ВНИМАНИЕ! РЕЖИМ С МАТОМ АКТИВИРОВАН!**", parse_mode='Markdown')
-
-async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Информация о текущей модели"""
-    user_id = update.effective_user.id
-    
-    current_model = user_settings.get(user_id, {}).get('model', MODEL)
-    temperature = user_settings.get(user_id, {}).get('temperature', 0.7)
-    max_tokens = user_settings.get(user_id, {}).get('max_tokens', 1000)
-    current_mode = user_modes.get(user_id, DEFAULT_MODE)
-    
-    model_info_text = f"""
-🤖 **Информация о модели**
-
-**Текущая модель:** {current_model}
-**Текущий режим:** {get_mode_name(current_mode)}
-
-**Параметры:**
-• Температура: {temperature}
-• Max tokens: {max_tokens}
-
-**Доступные модели:**
-• /model_gpt3 - OpenAI GPT-3.5 Turbo
-• /model_gpt4 - OpenAI GPT-4
-• /model_claude - Anthropic Claude 2
-• /model_llama - Meta LLaMA 2
-• /model_mistral - Mistral 7B
-    """
-    
-    await safe_send_message(update, model_info_text, parse_mode='Markdown')
-
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Очистка истории диалога"""
-    user_id = update.effective_user.id
-    current_mode = user_modes.get(user_id, DEFAULT_MODE)
-    
-    user_conversations[user_id] = [{"role": "system", "content": SYSTEM_PROMPTS[current_mode]}]
-    
-    mode_emoji = "🤬" if current_mode == "mat" else "😈" if current_mode == "rude" else "🧹"
-    await safe_send_message(update, f"{mode_emoji} История диалога очищена!", reply_markup=get_main_keyboard())
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /settings - открыть настройки"""
-    await show_settings(update, context)
-    user_keyboard_state[update.effective_user.id] = "settings"
-
-async def model_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команд для смены модели"""
-    user_id = update.effective_user.id
-    text = update.message.text
-    
-    model_commands = {
-        "/model_gpt3": "gpt3",
-        "/model_gpt4": "gpt4", 
-        "/model_claude": "claude",
-        "/model_llama": "llama",
-        "/model_mistral": "mistral"
-    }
-    
-    if text in model_commands:
-        model_key = model_commands[text]
-        if user_id not in user_settings:
-            user_settings[user_id] = {}
-        user_settings[user_id]["model"] = AVAILABLE_MODELS[model_key]
-        
-        current_mode = user_modes.get(user_id, DEFAULT_MODE)
-        user_conversations[user_id] = [{"role": "system", "content": SYSTEM_PROMPTS[current_mode]}]
-        
-        await safe_send_message(update, f"✅ Модель изменена на {AVAILABLE_MODELS[model_key]}\nИстория диалога очищена.")
-
-async def temperature_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для установки температуры"""
-    user_id = update.effective_user.id
-    
-    if user_id not in user_settings:
-        user_settings[user_id] = {}
-    
-    if context.args:
-        try:
-            temp = float(context.args[0])
-            if 0 <= temp <= 2:
-                user_settings[user_id]["temperature"] = temp
-                await safe_send_message(update, f"✅ Температура изменена на {temp}")
-            else:
-                await safe_send_message(update, "❌ Температура должна быть от 0 до 2")
-        except ValueError:
-            await safe_send_message(update, "❌ Пожалуйста, введите число")
-    else:
-        current_temp = user_settings[user_id].get('temperature', 0.7)
-        await safe_send_message(update, f"🌡️ Текущая температура: {current_temp}\nИспользование: /temperature [0-2]")
-
-async def max_tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для установки max tokens"""
-    user_id = update.effective_user.id
-    
-    if user_id not in user_settings:
-        user_settings[user_id] = {}
-    
-    if context.args:
-        try:
-            tokens = int(context.args[0])
-            if 100 <= tokens <= 4000:
-                user_settings[user_id]["max_tokens"] = tokens
-                await safe_send_message(update, f"✅ Max tokens изменен на {tokens}")
-            else:
-                await safe_send_message(update, "❌ Max tokens должен быть от 100 до 4000")
-        except ValueError:
-            await safe_send_message(update, "❌ Пожалуйста, введите число")
-    else:
-        current_tokens = user_settings[user_id].get('max_tokens', 1000)
-        await safe_send_message(update, f"📏 Текущий max tokens: {current_tokens}\nИспользование: /max_tokens [100-4000]")
-
-async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для смены языка"""
-    user_id = update.effective_user.id
-    
-    if user_id not in user_settings:
-        user_settings[user_id] = {}
-    
-    if context.args:
-        lang = context.args[0].lower()
-        if lang in ["ru", "en"]:
-            user_settings[user_id]["language"] = lang
-            await safe_send_message(update, f"✅ Язык изменен на {lang}")
-        else:
-            await safe_send_message(update, "❌ Доступные языки: ru, en")
-    else:
-        current_lang = user_settings[user_id].get('language', 'ru')
-        await safe_send_message(update, f"🌐 Текущий язык: {current_lang}\nИспользование: /language [ru/en]")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /stats - показать статистику"""
-    await show_stats(update, context)
-
-async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /about - информация о боте"""
-    await show_about(update, context)
-
-async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /mode - информация о режимах"""
-    await show_modes(update, context)
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка соединения"""
-    start_time = time.time()
-    message = await update.message.reply_text("🏓 Пинг...")
-    end_time = time.time()
-    
-    response_time = round((end_time - start_time) * 1000, 2)
-    await message.edit_text(f"🏓 Понг! Время ответа: {response_time}ms")
-
-async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Текущее время"""
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await safe_send_message(update, f"🕐 Текущее время: {current_time}")
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Эхо-команда"""
-    if context.args:
-        text = ' '.join(context.args)
-        await safe_send_message(update, f"📢 Эхо: {text}")
-    else:
-        await safe_send_message(update, "❌ Использование: /echo [текст]")
-
-async def roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Случайное число"""
-    number = random.randint(1, 100)
-    await safe_send_message(update, f"🎲 Случайное число: {number}")
-
-async def quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Случайная цитата"""
-    quotes = [
-        "Жизнь - это то, что с тобой происходит, пока ты строишь планы. — Джон Леннон",
-        "Будьте тем изменением, которое хотите увидеть в мире. — Махатма Ганди",
-        "Сложнее всего начать действовать, все остальное зависит только от упорства. — Амелия Эрхарт",
-        "Успех - это способность идти от неудачи к неудаче, не теряя энтузиазма. — Уинстон Черчилль",
-        "Не бойтесь совершенства, вам его не достичь. — Сальвадор Дали"
-    ]
-    await safe_send_message(update, f"💭 {random.choice(quotes)}")
 
 async def ask_openrouter(messages, user_id=None):
     """Асинхронный запрос к OpenRouter API"""
@@ -801,191 +680,95 @@ async def ask_openrouter(messages, user_id=None):
             return result['choices'][0]['message']['content'], None
         else:
             error_text = response.text
-            logger.error(f"Ошибка API: {response.status_code} - {error_text}")
+            logger.error(f"Ошибка API: {response.status_code}")
+            return None, f"❌ Ошибка API: {response.status_code}"
             
-            if response.status_code == 401:
-                return None, "❌ Ошибка авторизации API. Проверьте API ключ."
-            elif response.status_code == 429:
-                return None, "❌ Слишком много запросов. Попробуйте позже."
-            elif response.status_code == 503:
-                return None, "❌ Сервис временно недоступен. Попробуйте позже."
-            else:
-                return None, f"❌ Ошибка API: {response.status_code}"
-            
-    except requests.exceptions.Timeout:
-        logger.error("Таймаут запроса к OpenRouter")
-        return None, "❌ Превышено время ожидания ответа от API. Попробуйте позже."
-    except requests.exceptions.ConnectionError:
-        logger.error("Ошибка подключения к OpenRouter")
-        return None, "❌ Ошибка подключения к API. Проверьте интернет-соединение."
     except Exception as e:
-        logger.error(f"Исключение при запросе: {e}")
-        return None, f"❌ Произошла ошибка: {str(e)}"
+        logger.error(f"Исключение: {e}")
+        return None, f"❌ Ошибка: {str(e)}"
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /clear"""
     user_id = update.effective_user.id
-    user_message = update.message.text
-    
-    # Проверяем, не является ли сообщение командой
-    if user_message.startswith('/'):
-        return
-    
-    # Обновляем статистику
-    if user_id not in user_stats:
-        user_stats[user_id] = {
-            "messages": 0,
-            "first_seen": datetime.now(),
-            "last_active": datetime.now()
-        }
-    
-    user_stats[user_id]["messages"] += 1
-    user_stats[user_id]["last_active"] = datetime.now()
-    
-    # Получаем текущий режим пользователя
     current_mode = user_modes.get(user_id, DEFAULT_MODE)
-    
-    # Обновляем статистику режимов
-    mode_stats[current_mode] = mode_stats.get(current_mode, 0) + 1
-    
-    # Проверяем, не пустое ли сообщение
-    if not user_message.strip():
-        if current_mode == "mat":
-            await safe_send_message(update, "Слышь, ёбаный гений, ты че пустые сообщения шлешь? Совсем охренел? Напиши нормально, мудак!")
-        elif current_mode == "rude":
-            await safe_send_message(update, "Слушай, гений, ты вообще сообщение собираешься писать? Пустые сообщения - это новый вид искусства?")
-        else:
-            await safe_send_message(update, "Пожалуйста, отправьте непустое сообщение.")
-        return
-    
-    # Показываем, что бот печатает
-    await update.message.chat.send_action(action="typing")
-    
-    try:
-        # Получаем или создаем историю диалога для пользователя
-        if user_id not in user_conversations:
-            user_conversations[user_id] = [
-                {"role": "system", "content": SYSTEM_PROMPTS[current_mode]}
-            ]
-        
-        # Добавляем сообщение пользователя в историю
-        user_conversations[user_id].append({"role": "user", "content": user_message})
-        
-        # Ограничиваем историю последними 10 сообщениями
-        if len(user_conversations[user_id]) > 11:
-            user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-10:]
-        
-        # Отправляем запрос к OpenRouter
-        bot_response, error = await ask_openrouter(user_conversations[user_id], user_id)
-        
-        if error:
-            await safe_send_message(update, error, reply_markup=get_main_keyboard())
-            user_conversations[user_id].pop()
-            return
-        
-        # Добавляем ответ бота в историю
-        user_conversations[user_id].append({"role": "assistant", "content": bot_response})
-        
-        # Отправляем ответ пользователю
-        if len(bot_response) > 4096:
-            for x in range(0, len(bot_response), 4096):
-                await safe_send_message(update, bot_response[x:x+4096], reply_markup=get_main_keyboard())
-        else:
-            await safe_send_message(update, bot_response, reply_markup=get_main_keyboard())
-        
-    except Exception as e:
-        logger.error(f"Неизвестная ошибка: {e}")
-        if current_mode == "mat":
-            error_message = "🤬 Пиздец, ошибка какая-то! Даже мой отборный мат не помог! Попробуй позже, мудак!"
-        elif current_mode == "rude":
-            error_message = "❌ Ошибка! Даже мой сарказм не помог справиться с этой проблемой. Попробуй позже."
-        else:
-            error_message = "❌ Произошла неизвестная ошибка. Попробуйте позже."
-        await safe_send_message(update, error_message, reply_markup=get_main_keyboard())
-        
-        if user_id in user_conversations:
-            del user_conversations[user_id]
+    user_conversations[user_id] = [{"role": "system", "content": SYSTEM_PROMPTS[current_mode]}]
+    await safe_send_message(update, "🧹 История очищена!", reply_markup=get_main_keyboard())
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /settings"""
+    await show_settings(update)
+    user_state[update.effective_user.id] = "settings"
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /stats"""
+    await show_stats(update)
+
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /about"""
+    await show_about(update)
+
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /mode"""
+    await show_modes(update)
+
+async def mode_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /mode_normal"""
+    user_id = update.effective_user.id
+    user_modes[user_id] = "normal"
+    if user_id in user_conversations:
+        user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["normal"]}
+    await safe_send_message(update, "✅ Обычный режим", reply_markup=get_main_keyboard())
+
+async def mode_rude(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /mode_rude"""
+    user_id = update.effective_user.id
+    user_modes[user_id] = "rude"
+    if user_id in user_conversations:
+        user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["rude"]}
+    await safe_send_message(update, "✅ Режим хама", reply_markup=get_main_keyboard())
+
+async def mode_mat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /mode_mat"""
+    user_id = update.effective_user.id
+    user_modes[user_id] = "mat"
+    if user_id in user_conversations:
+        user_conversations[user_id][0] = {"role": "system", "content": SYSTEM_PROMPTS["mat"]}
+    await safe_send_message(update, "⚠️ РЕЖИМ С МАТОМ!", reply_markup=get_main_keyboard())
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
-    logger.error(f"Ошибка при обработке обновления {update}: {context.error}")
-    
-    if "Can't parse entities" in str(context.error):
-        return
-    
-    if update and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "❌ Произошла внутренняя ошибка бота. Администраторы уже уведомлены."
-            )
-        except:
-            pass
+    logger.error(f"Ошибка: {context.error}")
 
 def main():
-    """Главная функция запуска бота"""
+    """Главная функция"""
     
     print("🚀 Запуск бота...")
-    print(f"📱 Токен Telegram: {TELEGRAM_TOKEN[:10]}...")
-    print(f"🔑 API ключ OpenRouter: {OPENROUTER_API_KEY[:10]}...")
-    print(f"🤖 Модель по умолчанию: {MODEL}")
-    print(f"🎭 Режимы: Normal + Rude + MAT (18+)")
+    print(f"🤖 Модель: {MODEL}")
     print(f"🔘 Кнопки под строкой ввода: ВКЛ")
     
-    try:
-        application = Application.builder().token(TELEGRAM_TOKEN).build()
-        
-        # Обработчик для кнопок под строкой ввода
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
-        
-        # Команды
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("settings", settings_command))
-        application.add_handler(CommandHandler("stats", stats_command))
-        application.add_handler(CommandHandler("about", about_command))
-        application.add_handler(CommandHandler("mode", mode_command))
-        application.add_handler(CommandHandler("clear", clear))
-        application.add_handler(CommandHandler("model", model_info))
-        
-        # Команды для смены модели
-        application.add_handler(CommandHandler("model_gpt3", model_commands))
-        application.add_handler(CommandHandler("model_gpt4", model_commands))
-        application.add_handler(CommandHandler("model_claude", model_commands))
-        application.add_handler(CommandHandler("model_llama", model_commands))
-        application.add_handler(CommandHandler("model_mistral", model_commands))
-        
-        # Команды для настроек
-        application.add_handler(CommandHandler("temperature", temperature_command))
-        application.add_handler(CommandHandler("max_tokens", max_tokens_command))
-        application.add_handler(CommandHandler("language", language_command))
-        
-        # Команды для режимов
-        application.add_handler(CommandHandler("mode_normal", mode_normal))
-        application.add_handler(CommandHandler("mode_rude", mode_rude))
-        application.add_handler(CommandHandler("mode_mat", mode_mat))
-        
-        # Дополнительные команды
-        application.add_handler(CommandHandler("ping", ping))
-        application.add_handler(CommandHandler("time", time_command))
-        application.add_handler(CommandHandler("echo", echo))
-        application.add_handler(CommandHandler("roll", roll))
-        application.add_handler(CommandHandler("quote", quote))
-        
-        # Обработчик сообщений (для вопросов к боту)
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        
-        # Обработчик ошибок
-        application.add_error_handler(error_handler)
-        
-        print("✅ Бот успешно запущен! Нажми Ctrl+C для остановки.")
-        print(f"📊 Всего команд: 20+")
-        print(f"🔘 Кнопки под строкой ввода активны")
-        print(f"😈 Режим хама: /mode_rude")
-        print(f"🤬 РЕЖИМ С МАТОМ: /mode_mat (18+)")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
-    except Exception as e:
-        print(f"❌ Ошибка при запуске бота: {e}")
-        logger.error(f"Ошибка при запуске бота: {e}")
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("about", about_command))
+    application.add_handler(CommandHandler("mode", mode_command))
+    application.add_handler(CommandHandler("clear", clear_command))
+    
+    # Режимы
+    application.add_handler(CommandHandler("mode_normal", mode_normal))
+    application.add_handler(CommandHandler("mode_rude", mode_rude))
+    application.add_handler(CommandHandler("mode_mat", mode_mat))
+    
+    # Главный обработчик сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Ошибки
+    application.add_error_handler(error_handler)
+    
+    print("✅ Бот запущен!")
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
