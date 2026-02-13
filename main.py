@@ -1,13 +1,13 @@
 import os
 import logging
-import aiohttp
+import requests
 import json
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Настройка логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -20,17 +20,12 @@ OPENROUTER_API_KEY = "sk-or-v1-fd35896c0dc2d75eadbf97db0e52ef6f983b1fc001663c219
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Настройки модели
-MODEL = "openai/gpt-3.5-turbo"  # Можно изменить на другую модель
-# Другие популярные модели:
-# "anthropic/claude-2" 
-# "google/palm-2-chat-bison"
-# "meta-llama/llama-2-70b-chat"
-# "openai/gpt-4"
+MODEL = "openai/gpt-3.5-turbo"  # Используем доступную модель
 
 # Системный промпт для настройки поведения бота
 SYSTEM_PROMPT = "Ты полезный ассистент, который отвечает на вопросы пользователей на русском языке."
 
-# Словарь для хранения истории разговоров (в продакшене лучше использовать БД)
+# Словарь для хранения истории разговоров
 user_conversations = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -61,13 +56,11 @@ async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Информация о текущей модели"""
     await update.message.reply_text(
         f"🤖 Текущая модель: {MODEL}\n\n"
-        "Доступные модели на OpenRouter:\n"
+        "Популярные модели на OpenRouter:\n"
         "• openai/gpt-3.5-turbo\n"
         "• openai/gpt-4\n"
         "• anthropic/claude-2\n"
-        "• google/palm-2-chat-bison\n"
-        "• meta-llama/llama-2-70b-chat\n\n"
-        "Для смены модели нужно изменить код."
+        "• meta-llama/llama-2-70b-chat"
     )
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -77,12 +70,17 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del user_conversations[user_id]
     await update.message.reply_text("🧹 История диалога очищена!")
 
-async def ask_openrouter(messages):
-    """Отправка запроса к OpenRouter API"""
+def ask_openrouter_sync(messages):
+    """Синхронный запрос к OpenRouter API"""
+    
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
+    
+    # Опционально можно добавить информацию о сайте
+    # "HTTP-Referer": "http://localhost:8000",
+    # "X-Title": "Telegram Bot",
     
     data = {
         "model": MODEL,
@@ -91,19 +89,31 @@ async def ask_openrouter(messages):
         "temperature": 0.7,
     }
     
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(OPENROUTER_URL, headers=headers, json=data) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result['choices'][0]['message']['content'], None
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Ошибка API: {response.status} - {error_text}")
-                    return None, f"Ошибка API: {response.status}"
-        except Exception as e:
-            logger.error(f"Исключение при запросе: {e}")
-            return None, str(e)
+    try:
+        response = requests.post(
+            url=OPENROUTER_URL,
+            headers=headers,
+            data=json.dumps(data),
+            timeout=30  # Таймаут 30 секунд
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['choices'][0]['message']['content'], None
+        else:
+            error_text = response.text
+            logger.error(f"Ошибка API: {response.status_code} - {error_text}")
+            return None, f"Ошибка API: {response.status_code}"
+            
+    except requests.exceptions.Timeout:
+        logger.error("Таймаут запроса к OpenRouter")
+        return None, "Превышено время ожидания ответа от API"
+    except requests.exceptions.ConnectionError:
+        logger.error("Ошибка подключения к OpenRouter")
+        return None, "Ошибка подключения к API"
+    except Exception as e:
+        logger.error(f"Исключение при запросе: {e}")
+        return None, str(e)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
@@ -127,8 +137,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(user_conversations[user_id]) > 11:  # system + 10 сообщений
             user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-10:]
         
-        # Отправляем запрос к OpenRouter
-        bot_response, error = await ask_openrouter(user_conversations[user_id])
+        # Отправляем запрос к OpenRouter (в отдельном потоке, чтобы не блокировать бота)
+        bot_response, error = await context.application.loop.run_in_executor(
+            None,  # Используем стандартный executor
+            ask_openrouter_sync,
+            user_conversations[user_id]
+        )
         
         if error:
             await update.message.reply_text(f"❌ Произошла ошибка: {error}")
@@ -155,18 +169,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Главная функция запуска бота"""
     
-    # Проверяем наличие токенов
-    if TELEGRAM_TOKEN == "8569245180:AAFAkYJ56d6BPzMXIjHOjOkKX56KL5rFi_4":
-        logger.info("Токен Telegram указан")
-    else:
-        logger.error("Проблема с Telegram токеном")
-        return
-    
-    if OPENROUTER_API_KEY and OPENROUTER_API_KEY.startswith("sk-or-"):
-        logger.info("Ключ OpenRouter указан корректно")
-    else:
-        logger.error("Проблема с ключом OpenRouter")
-        return
+    print("🚀 Запуск бота...")
     
     # Создаем приложение
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -182,6 +185,8 @@ def main():
     
     # Регистрируем обработчик ошибок
     application.add_error_handler(error_handler)
+    
+    print("✅ Бот успешно запущен! Нажми Ctrl+C для остановки.")
     application.run_polling()
 
 if __name__ == "__main__":
