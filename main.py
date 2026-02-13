@@ -226,7 +226,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_text = (
         f"👋 Привет, {user_name}! Я бот на основе ChatGPT.\n"
         f"Используй кнопки под строкой ввода для управления 👇\n\n"
-        f"Текущий режим: {get_mode_name(user_modes[user_id])}"
+        f"👤 Разработчик: @Dzmitry_10\n"
+        f"📅 Год создания: 2026\n"
+        f"🎭 Текущий режим: {get_mode_name(user_modes[user_id])}"
     )
     
     await safe_send_message(update, start_text, reply_markup=get_main_keyboard())
@@ -469,6 +471,7 @@ async def process_question(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             await safe_send_message(update, "Слушай, гений, ты вообще сообщение собираешься писать? Пустые сообщения - это новый вид искусства?")
         else:
             await safe_send_message(update, "Пожалуйста, отправьте непустое сообщение.")
+        user_state[user_id] = "menu"
         return
     
     # Показываем, что бот печатает
@@ -488,11 +491,11 @@ async def process_question(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         if len(user_conversations[user_id]) > 11:
             user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-10:]
         
-        # Получаем ответ
+        # Получаем ответ от OpenRouter
         bot_response, error = await ask_openrouter(user_conversations[user_id], user_id)
         
         if error:
-            await safe_send_message(update, error, reply_markup=get_main_keyboard())
+            await safe_send_message(update, f"❌ {error}", reply_markup=get_main_keyboard())
             user_conversations[user_id].pop()
             user_state[user_id] = "menu"
             return
@@ -600,8 +603,8 @@ async def show_about(update: Update):
 • Статистика использования
 • Удобные кнопки под строкой ввода
 
-**Разработчик:** @Dzmitry_10
-**Дата создания:** 2024
+**👤 Разработчик:** @Dzmitry_10
+**📅 Год создания:** 2026
     """
     await safe_send_message(update, about_text, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
@@ -652,8 +655,8 @@ async def ask_openrouter(messages, user_id=None):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://t.me/your_bot",
-        "X-Title": "Telegram ChatGPT Bot"
+        "HTTP-Referer": "https://t.me/Dzmitry_10",
+        "X-Title": "Telegram ChatGPT Bot by Dzmitry_10"
     }
     
     data = {
@@ -681,11 +684,11 @@ async def ask_openrouter(messages, user_id=None):
         else:
             error_text = response.text
             logger.error(f"Ошибка API: {response.status_code}")
-            return None, f"❌ Ошибка API: {response.status_code}"
+            return None, f"Ошибка API: {response.status_code}"
             
     except Exception as e:
         logger.error(f"Исключение: {e}")
-        return None, f"❌ Ошибка: {str(e)}"
+        return None, f"Ошибка: {str(e)}"
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /clear"""
@@ -743,6 +746,8 @@ def main():
     """Главная функция"""
     
     print("🚀 Запуск бота...")
+    print(f"👤 Разработчик: @Dzmitry_10")
+    print(f"📅 Год: 2026")
     print(f"🤖 Модель: {MODEL}")
     print(f"🔘 Кнопки под строкой ввода: ВКЛ")
     
@@ -767,7 +772,8 @@ def main():
     # Ошибки
     application.add_error_handler(error_handler)
     
-    print("✅ Бот запущен!")
+    print("✅ Бот успешно запущен!")
+    print("💬 Отправь /start для начала работы")
     application.run_polling()
 
 if __name__ == "__main__":
