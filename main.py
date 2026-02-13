@@ -1,48 +1,188 @@
-import asyncio
+import os
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+import aiohttp
+import json
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Включаем логирование
-logging.basicConfig(level=logging.INFO)
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Твой токен (уже вставлен)
-BOT_TOKEN = '8569245180:AAFAkYJ56d6BPzMXIjHOjOkKX56KL5rFi_4'
+# Конфигурация - ваши данные
+TELEGRAM_TOKEN = "8569245180:AAFAkYJ56d6BPzMXIjHOjOkKX56KL5rFi_4"
+OPENROUTER_API_KEY = "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"
 
-# Создаем объекты бота и диспетчера
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# URL для OpenRouter API
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Обработчик команды /start
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer(
-        f"Привет, {message.from_user.full_name}!\n"
-        f"Я простой эхо-бот. Отправь мне любое сообщение, и я повторю его."
+# Настройки модели
+MODEL = "openai/gpt-3.5-turbo"  # Можно изменить на другую модель
+# Другие популярные модели:
+# "anthropic/claude-2" 
+# "google/palm-2-chat-bison"
+# "meta-llama/llama-2-70b-chat"
+# "openai/gpt-4"
+
+# Системный промпт для настройки поведения бота
+SYSTEM_PROMPT = "Ты полезный ассистент, который отвечает на вопросы пользователей на русском языке."
+
+# Словарь для хранения истории разговоров (в продакшене лучше использовать БД)
+user_conversations = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    await update.message.reply_text(
+        "👋 Привет! Я бот на основе ChatGPT (через OpenRouter).\n"
+        "Задай мне любой вопрос, и я постараюсь помочь!\n\n"
+        "Команды:\n"
+        "/start - Показать это сообщение\n"
+        "/clear - Очистить историю диалога\n"
+        "/model - Информация о текущей модели\n"
+        "/help - Получить помощь"
     )
 
-# Обработчик команды /help
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "Я умею:\n"
-        "/start - Поздороваться\n"
-        "/help - Показать эту справку\n"
-        "(и просто повторять любой твой текст)"
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    await update.message.reply_text(
+        "🤖 Как пользоваться ботом:\n\n"
+        "Просто отправь мне сообщение с вопросом, и я отвечу!\n\n"
+        "💡 Советы:\n"
+        "• Чем точнее вопрос, тем лучше ответ\n"
+        "• Используй /clear для сброса диалога\n"
+        "• Бот помнит контекст разговора\n\n"
+        f"Текущая модель: {MODEL}"
     )
 
-# Обработчик для любого текстового сообщения (эхо)
-@dp.message()
-async def echo_message(message: types.Message):
-    if message.text:
-        await message.answer(f"Ты написал: {message.text}")
+async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Информация о текущей модели"""
+    await update.message.reply_text(
+        f"🤖 Текущая модель: {MODEL}\n\n"
+        "Доступные модели на OpenRouter:\n"
+        "• openai/gpt-3.5-turbo\n"
+        "• openai/gpt-4\n"
+        "• anthropic/claude-2\n"
+        "• google/palm-2-chat-bison\n"
+        "• meta-llama/llama-2-70b-chat\n\n"
+        "Для смены модели нужно изменить код."
+    )
 
-# Функция запуска бота
-async def main():
-    print("Бот запущен! Напиши ему в Telegram: @твой_бот")
-    print("(Чтобы остановить, нажми Ctrl+C)")
-    await dp.start_polling(bot)
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очистка истории диалога"""
+    user_id = update.effective_user.id
+    if user_id in user_conversations:
+        del user_conversations[user_id]
+    await update.message.reply_text("🧹 История диалога очищена!")
 
-# Запускаем бота
+async def ask_openrouter(messages):
+    """Отправка запроса к OpenRouter API"""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": 1000,
+        "temperature": 0.7,
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(OPENROUTER_URL, headers=headers, json=data) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return result['choices'][0]['message']['content'], None
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Ошибка API: {response.status} - {error_text}")
+                    return None, f"Ошибка API: {response.status}"
+        except Exception as e:
+            logger.error(f"Исключение при запросе: {e}")
+            return None, str(e)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений"""
+    user_id = update.effective_user.id
+    user_message = update.message.text
+    
+    # Показываем, что бот печатает
+    await update.message.chat.send_action(action="typing")
+    
+    try:
+        # Получаем или создаем историю диалога для пользователя
+        if user_id not in user_conversations:
+            user_conversations[user_id] = [
+                {"role": "system", "content": SYSTEM_PROMPT}
+            ]
+        
+        # Добавляем сообщение пользователя в историю
+        user_conversations[user_id].append({"role": "user", "content": user_message})
+        
+        # Ограничиваем историю последними 10 сообщениями
+        if len(user_conversations[user_id]) > 11:  # system + 10 сообщений
+            user_conversations[user_id] = [user_conversations[user_id][0]] + user_conversations[user_id][-10:]
+        
+        # Отправляем запрос к OpenRouter
+        bot_response, error = await ask_openrouter(user_conversations[user_id])
+        
+        if error:
+            await update.message.reply_text(f"❌ Произошла ошибка: {error}")
+            return
+        
+        # Добавляем ответ бота в историю
+        user_conversations[user_id].append({"role": "assistant", "content": bot_response})
+        
+        # Отправляем ответ пользователю (разбиваем если слишком длинный)
+        if len(bot_response) > 4096:
+            for x in range(0, len(bot_response), 4096):
+                await update.message.reply_text(bot_response[x:x+4096])
+        else:
+            await update.message.reply_text(bot_response)
+        
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка: {e}")
+        await update.message.reply_text("❌ Произошла неизвестная ошибка. Попробуй позже.")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка при обработке обновления {update}: {context.error}")
+
+def main():
+    """Главная функция запуска бота"""
+    
+    # Проверяем наличие токенов
+    if TELEGRAM_TOKEN == "8569245180:AAFAkYJ56d6BPzMXIjHOjOkKX56KL5rFi_4":
+        logger.info("Токен Telegram указан")
+    else:
+        logger.error("Проблема с Telegram токеном")
+        return
+    
+    if OPENROUTER_API_KEY and OPENROUTER_API_KEY.startswith("sk-or-"):
+        logger.info("Ключ OpenRouter указан корректно")
+    else:
+        logger.error("Проблема с ключом OpenRouter")
+        return
+    
+    # Создаем приложение
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("clear", clear))
+    application.add_handler(CommandHandler("model", model_info))
+    
+    # Регистрируем обработчик текстовых сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Регистрируем обработчик ошибок
+    application.add_error_handler(error_handler)
+    application.run_polling()
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
