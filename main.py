@@ -1,4 +1,4 @@
-import os
+проimport os
 import logging
 import requests
 import json
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация - ваши данные
 TELEGRAM_TOKEN = "8569245180:AAFAkYJ56d6BPzMXIjHOjOkKX56KL5rFi_4"
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "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"
 
 # URL для OpenRouter API
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
