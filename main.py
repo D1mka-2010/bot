@@ -9,7 +9,7 @@ from groq import Groq
 import random
 
 # Токены
-TELEGRAM_TOKEN = "8569245180:AAFAkYJ56d6BPzMXIjHOjOkKX56KL5rFi_4"
+TELEGRAM_TOKEN = "8515320919:AAHa7qkTSN--6JbmVHHQ6RUQ4ako159kWsc"
 GROQ_API_KEY = "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"
 
 # ============================================
