@@ -8,7 +8,7 @@ import socket
 from groq import Groq
 
 # Токены
-TELEGRAM_TOKEN = "8569245180:AAFAkYJ56d6BPzMXIjHOjOkKX56KL5rFi_4"
+TELEGRAM_TOKEN = "8500457764:AAHVKKTU5Y9WMyawlFYsjMf15iDOoXCQTUA"
 GROQ_API_KEY = "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"
 
 # ============================================
