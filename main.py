@@ -14,7 +14,7 @@ GROQ_API_KEY = "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"
 # ============================================
 # НАСТРОЙКА ПРОКСИ
 # ============================================
-USE_PROXY = False  # Пока отключаем прокси, так как он не работает
+USE_PROXY = False  # Прокси отключен
 PROXY_HOST = "195.74.72.111"
 PROXY_PORT = 5678
 PROXY_TYPE = socks.SOCKS4
@@ -36,10 +36,9 @@ if USE_PROXY:
 # Создаем клиент Groq
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Модели
+# Модели (убрал вторую по счету LLaMA 3.2 3B)
 MODELS = {
     "🚀 LLaMA 3.1 8B": "llama-3.1-8b-instant",
-    "⚡ LLaMA 3.2 3B": "llama-3.2-3b-preview",
     "🔸 Gemma 2 9B": "gemma2-9b-it",
     "🎯 LLaMA 3.3 70B": "llama-3.3-70b-versatile",
 }
@@ -178,11 +177,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         user_data[user_id]["in_dialog"] = True
     
-    wait_msg = await update.message.reply_text(
-        "⏳ Обрабатываю запрос...",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    
+    # Показываем "печатает..."
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
     try:
@@ -205,8 +200,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assistant_message = response.choices[0].message.content
         history.append({"role": "assistant", "content": assistant_message})
         
-        await wait_msg.delete()
-        
+        # Отправляем ответ и сразу показываем кнопку завершения
         await update.message.reply_text(
             assistant_message,
             reply_markup=get_end_dialog_keyboard()
@@ -214,7 +208,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logger.error(f"Ошибка: {e}")
-        await wait_msg.delete()
         await update.message.reply_text(
             "❌ Ошибка. Попробуйте позже.",
             reply_markup=ReplyKeyboardRemove()
@@ -380,13 +373,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("🎭 Бот запускается...")
     print("="*50)
-    if USE_PROXY:
-        print(f"🌐 Прокси: {PROXY_HOST}:{PROXY_PORT} (SOCKS4)")
-    else:
-        print("🌐 Режим: без прокси")
+    print("✅ Убрано сообщение 'Обрабатываю запрос'")
+    print("✅ Кнопка завершения появляется только после ответа")
+    print("✅ Убрана вторая модель (LLaMA 3.2 3B)")
     print("="*50)
     
-    # Создаем и запускаем приложение
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
@@ -396,7 +387,6 @@ def main():
     
     print("\n✅ Бот готов к работе!")
     
-    # Запускаем бота
     try:
         application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     except Exception as e:
