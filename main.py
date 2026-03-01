@@ -13,7 +13,7 @@ import sys
 
 # Токены
 TELEGRAM_TOKEN = "8515320919:AAHvp2FNdO_bOgH_02K95CBCSaE6t2ufp70"
-GROQ_API_KEY = "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"
+GROQ_API_KEY = "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"
 
 # ============================================
 # НАСТРОЙКА ПРОКСИ - ВЫКЛЮЧЕНО
