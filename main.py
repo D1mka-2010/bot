@@ -10,6 +10,7 @@ from groq import Groq
 import datetime
 import os
 import sys
+import uuid
 
 # Токены
 TELEGRAM_TOKEN = "8515320919:AAHvp2FNdO_bOgH_02K95CBCSaE6t2ufp70"
@@ -79,12 +80,15 @@ class CustomFormatter(logging.Formatter):
             '⭐': '[STAR]',
             '🌟': ['GLOWING STAR'],
             '💫': '[STARRY]',
+            '❤️': '[LIKE]',
+            '👍': '[LIKE]',
+            '⚙️': '[SETTINGS]',
+            '📝': '[EDIT]',
+            '🔢': '[LIMIT]',
         }
     
     def format(self, record):
-        # Сначала форматируем как обычно
         result = super().format(record)
-        # Заменяем эмодзи на текстовые аналоги
         for emoji, text in self.emoji_map.items():
             result = result.replace(emoji, text)
         return result
@@ -93,27 +97,23 @@ class CustomFormatter(logging.Formatter):
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Создаем обработчик для файла (UTF-8)
 file_handler = logging.FileHandler('bot.log', encoding='utf-8')
 file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 
-# Создаем обработчик для консоли с заменой эмодзи
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 console_formatter = CustomFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 
-# Перенаправляем stderr и stdout для корректной обработки Unicode
 if sys.platform == 'win32':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-# НЕ используем прокси
 if USE_PROXY:
     try:
         socks.set_default_proxy(PROXY_TYPE, PROXY_HOST, PROXY_PORT)
@@ -121,13 +121,9 @@ if USE_PROXY:
         logger.info("Прокси настроен")
     except Exception as e:
         logger.error(f"Ошибка настройки прокси: {e}")
-        logger.info("Работаем без прокси")
 
-# Создаем клиент Groq с таймаутами
-groq_client = Groq(
-    api_key=GROQ_API_KEY,
-    timeout=30.0
-)
+# Создаем клиент Groq
+groq_client = Groq(api_key=GROQ_API_KEY, timeout=30.0)
 
 # Модели
 MODELS = {
@@ -161,15 +157,202 @@ MODES = {
 DEFAULT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_MODE = "normal"
 
+# Структура данных пользователя
 user_data = {}
 user_last_message = {}
 menu_messages = {}
+awaiting_input = {}  # Для ожидания ввода
+liked_messages = {}  # Сохраненные сообщения с лайками
+dialog_messages = {}  # Для хранения ID сообщений в диалоге
+last_message_index = {}  # Для хранения индекса последнего сообщения
+last_user_message_index = {}  # Для хранения индекса последнего сообщения пользователя
+last_bot_message_index = {}  # Для хранения индекса последнего сообщения бота
 
-# Время запуска бота для отслеживания аптайма
+# Время запуска бота
 bot_start_time = time.time()
 
+# Константы
+MAX_CHATS = 10
+MAX_SAVED_MESSAGES = 50  # Максимальное количество сохраняемых сообщений
+
+def init_user_data(user_id):
+    """Инициализация данных пользователя"""
+    if user_id not in user_data:
+        user_data[user_id] = {
+            "chats": [],  # Постоянные чаты
+            "temp_chat": None,  # Временный чат
+            "current_chat_id": None,
+            "current_chat": None,
+            "chat_type": None,  # "permanent" или "temporary"
+            "in_dialog": False,
+            "showing_action_buttons": False,
+            "model": DEFAULT_MODEL,
+            "mode": DEFAULT_MODE,
+            "total_messages": 0,
+            "saved_messages_limit": MAX_SAVED_MESSAGES,  # Лимит сохраняемых сообщений
+            "auto_delete": False,  # Автоматическое удаление старых сообщений
+        }
+        dialog_messages[user_id] = []  # Список ID сообщений в текущем диалоге
+        last_message_index[user_id] = -1  # Индекс последнего сообщения
+        last_user_message_index[user_id] = -1  # Индекс последнего сообщения пользователя
+        last_bot_message_index[user_id] = -1  # Индекс последнего сообщения бота
+
+def create_chat(user_id, name, is_temporary=False):
+    """Создание нового чата"""
+    if user_id not in user_data:
+        init_user_data(user_id)
+    
+    chat_id = str(uuid.uuid4())[:8]
+    
+    new_chat = {
+        "id": chat_id,
+        "name": name,
+        "messages": [{"role": "system", "content": MODES[user_data[user_id]["mode"]]["system_prompt"]}],
+        "created": time.time(),
+        "model": user_data[user_id]["model"],
+        "mode": user_data[user_id]["mode"],
+        "is_temporary": is_temporary,
+        "liked_messages": []  # ID сохраненных сообщений
+    }
+    
+    if is_temporary:
+        user_data[user_id]["temp_chat"] = new_chat
+        user_data[user_id]["current_chat"] = new_chat
+        user_data[user_id]["current_chat_id"] = chat_id
+        user_data[user_id]["chat_type"] = "temporary"
+    else:
+        # Проверяем лимит постоянных чатов
+        permanent_chats = [c for c in user_data[user_id]["chats"] if not c.get("is_temporary", False)]
+        if len(permanent_chats) >= MAX_CHATS:
+            return None, "Достигнут лимит чатов. Нужно удалить старый."
+        
+        user_data[user_id]["chats"].append(new_chat)
+        user_data[user_id]["current_chat"] = new_chat
+        user_data[user_id]["current_chat_id"] = chat_id
+        user_data[user_id]["chat_type"] = "permanent"
+    
+    return chat_id, None
+
+def switch_chat(user_id, chat_id):
+    """Переключение на другой чат"""
+    if user_id not in user_data:
+        return False
+    
+    # Проверяем временный чат
+    if user_data[user_id]["temp_chat"] and user_data[user_id]["temp_chat"]["id"] == chat_id:
+        user_data[user_id]["current_chat"] = user_data[user_id]["temp_chat"]
+        user_data[user_id]["current_chat_id"] = chat_id
+        user_data[user_id]["chat_type"] = "temporary"
+        return True
+    
+    # Проверяем постоянные чаты
+    for chat in user_data[user_id]["chats"]:
+        if chat["id"] == chat_id:
+            user_data[user_id]["current_chat"] = chat
+            user_data[user_id]["current_chat_id"] = chat_id
+            user_data[user_id]["chat_type"] = "permanent" if not chat.get("is_temporary") else "temporary"
+            
+            # Обновляем настройки под чат
+            user_data[user_id]["model"] = chat.get("model", DEFAULT_MODEL)
+            user_data[user_id]["mode"] = chat.get("mode", DEFAULT_MODE)
+            return True
+    return False
+
+def delete_oldest_chat(user_id):
+    """Удаление самого старого постоянного чата"""
+    if user_id not in user_data:
+        return False
+    
+    permanent_chats = [c for c in user_data[user_id]["chats"] if not c.get("is_temporary", False)]
+    if permanent_chats:
+        oldest = min(permanent_chats, key=lambda x: x["created"])
+        user_data[user_id]["chats"].remove(oldest)
+        return True
+    return False
+
+def like_message(user_id, message_index, is_user_message=False):
+    """Поставить лайк/сохранить сообщение"""
+    if user_id not in user_data or not user_data[user_id]["current_chat"]:
+        return False, "Нет активного чата"
+    
+    chat = user_data[user_id]["current_chat"]
+    messages = [m for m in chat["messages"] if m["role"] != "system"]
+    
+    if 0 <= message_index < len(messages):
+        message = messages[message_index]
+        
+        # Проверяем лимит сохраненных сообщений
+        if user_id in liked_messages and len(liked_messages[user_id]) >= user_data[user_id]["saved_messages_limit"]:
+            if user_data[user_id]["auto_delete"]:
+                # Удаляем самое старое сообщение
+                liked_messages[user_id].pop(0)
+            else:
+                return False, f"Достигнут лимит сохраненных сообщений ({user_data[user_id]['saved_messages_limit']})"
+        
+        # Инициализируем список лайкнутых сообщений для чата
+        if "liked_messages" not in chat:
+            chat["liked_messages"] = []
+        
+        # Проверяем, не лайкнуто ли уже
+        message_id = f"{chat['id']}_{message_index}"
+        if message_id in chat["liked_messages"]:
+            return False, "Сообщение уже сохранено"
+        
+        chat["liked_messages"].append(message_id)
+        
+        # Сохраняем в общее хранилище
+        if user_id not in liked_messages:
+            liked_messages[user_id] = []
+        
+        liked_messages[user_id].append({
+            "id": message_id,
+            "chat_id": chat["id"],
+            "chat_name": chat["name"],
+            "message": message["content"],
+            "role": message["role"],
+            "timestamp": time.time(),
+            "is_user": is_user_message
+        })
+        
+        role_text = "пользователя" if is_user_message else "бота"
+        return True, f"✅ Сообщение {role_text} сохранено в избранное!"
+    
+    return False, "Сообщение не найдено"
+
+def delete_liked_message(user_id, message_id):
+    """Удалить сообщение из избранного"""
+    if user_id not in liked_messages:
+        return False, "Нет сохраненных сообщений"
+    
+    for i, msg in enumerate(liked_messages[user_id]):
+        if msg["id"] == message_id:
+            liked_messages[user_id].pop(i)
+            
+            # Также удаляем из чата
+            for chat in user_data[user_id]["chats"]:
+                if chat["id"] == msg["chat_id"] and message_id in chat.get("liked_messages", []):
+                    chat["liked_messages"].remove(message_id)
+            
+            return True, "✅ Сообщение удалено из избранного"
+    
+    return False, "Сообщение не найдено"
+
+def set_saved_messages_limit(user_id, limit):
+    """Установить лимит сохраненных сообщений"""
+    if user_id in user_data:
+        user_data[user_id]["saved_messages_limit"] = max(1, min(limit, 100))  # Ограничиваем от 1 до 100
+        return True
+    return False
+
+def toggle_auto_delete(user_id):
+    """Переключить автоматическое удаление старых сообщений"""
+    if user_id in user_data:
+        user_data[user_id]["auto_delete"] = not user_data[user_id]["auto_delete"]
+        return user_data[user_id]["auto_delete"]
+    return False
+
 def get_main_keyboard(user_id):
-    """Главная inline-клавиатура в сообщении"""
+    """Главная inline-клавиатура"""
     if user_id in user_data:
         mode_emoji = MODES[user_data[user_id]["mode"]]["emoji"]
     else:
@@ -181,10 +364,52 @@ def get_main_keyboard(user_id):
             InlineKeyboardButton("🚀 Модель", callback_data="show_models")
         ],
         [
-            InlineKeyboardButton("📋 История", callback_data="show_history"),
-            InlineKeyboardButton("ℹ️ Инфо", callback_data="settings")
+            InlineKeyboardButton("📋 Чаты", callback_data="show_chats"),
+            InlineKeyboardButton("ℹ️ Инфо", callback_data="show_info")
         ]
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_action_keyboard():
+    """Reply-клавиатура с кнопками действий"""
+    keyboard = [
+        [KeyboardButton("👤 СОХРАНИТЬ МОЁ"), KeyboardButton("🤖 СОХРАНИТЬ БОТА")],
+        [KeyboardButton("❤️ МОЁ ИЗБРАННОЕ"), KeyboardButton("❌ ЗАВЕРШИТЬ ДИАЛОГ")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+def get_liked_messages_keyboard(user_id, page=0):
+    """Клавиатура для просмотра избранных сообщений"""
+    if user_id not in liked_messages or not liked_messages[user_id]:
+        return None
+    
+    messages = liked_messages[user_id]
+    items_per_page = 5
+    start = page * items_per_page
+    end = min(start + items_per_page, len(messages))
+    
+    keyboard = []
+    
+    for i in range(start, end):
+        msg = messages[i]
+        role_emoji = "👤" if msg.get("is_user") else "🤖"
+        preview = msg["message"][:30] + "..." if len(msg["message"]) > 30 else msg["message"]
+        btn_text = f"{role_emoji} {preview}"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"view_liked_{i}")])
+    
+    # Кнопки навигации
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"liked_page_{page-1}"))
+    nav_buttons.append(InlineKeyboardButton(f"{page+1}/{(len(messages)-1)//items_per_page + 1}", callback_data="ignore"))
+    if end < len(messages):
+        nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"liked_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+    
     return InlineKeyboardMarkup(keyboard)
 
 def get_end_dialog_keyboard():
@@ -193,6 +418,13 @@ def get_end_dialog_keyboard():
         [KeyboardButton("❌ ЗАВЕРШИТЬ ДИАЛОГ")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+def get_back_to_menu_keyboard():
+    """Клавиатура с кнопкой возврата в главное меню"""
+    keyboard = [
+        [InlineKeyboardButton("◀️ Вернуться в главное меню", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 async def delete_menu(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Удаление предыдущего меню пользователя"""
@@ -206,10 +438,22 @@ async def delete_menu(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"Не удалось удалить меню: {e}")
         del menu_messages[user_id]
 
+async def delete_dialog_messages(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Удаление всех сообщений в текущем диалоге"""
+    if user_id in dialog_messages:
+        for message_id in dialog_messages[user_id]:
+            try:
+                await context.bot.delete_message(
+                    chat_id=user_id,
+                    message_id=message_id
+                )
+            except Exception as e:
+                logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
+        dialog_messages[user_id] = []
+
 async def post_init(application: Application):
     """Действия после инициализации бота"""
     try:
-        # Устанавливаем команды бота
         commands = [
             BotCommand("start", "Запустить бота"),
             BotCommand("ping", "Проверить скорость"),
@@ -224,38 +468,23 @@ async def post_init(application: Application):
         logger.error(f"Ошибка при инициализации: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт бота - НЕ УДАЛЯЕТ сообщение с командой"""
+    """Старт бота"""
     user_id = update.effective_user.id
     
-    # НЕ удаляем сообщение с командой /start
-    # Просто удаляем предыдущее меню если было
     await delete_menu(user_id, context)
     
     if user_id not in user_data:
-        user_data[user_id] = {
-            "model": DEFAULT_MODEL,
-            "mode": DEFAULT_MODE,
-            "history": [{"role": "system", "content": MODES[DEFAULT_MODE]["system_prompt"]}],
-            "in_dialog": False,
-            "showing_end_button": False
-        }
-    
-    # Получаем аптайм бота
-    uptime_seconds = int(time.time() - bot_start_time)
-    uptime_string = str(datetime.timedelta(seconds=uptime_seconds))
+        init_user_data(user_id)
+        # Создаем первый чат при старте
+        create_chat(user_id, "Основной чат", is_temporary=False)
     
     welcome_text = (
         f"👋 **Привет, {update.effective_user.first_name}!**\n\n"
-        f"📌 **Сейчас:** {MODES[user_data[user_id]['mode']]['name']} | {get_model_name(user_data[user_id]['model'])}\n\n"
-        f"💡 **Как пользоваться:**\n"
-        f"• Пиши сообщения - я буду отвечать\n"
-        f"• Кнопка ЗАВЕРШИТЬ ДИАЛОГ появляется после первого сообщения\n"
-        f"• Используй /ping для проверки скорости ответа\n"
-        f"• Используй /status для информации о боте"
+        f"💬 **Текущий чат:** {user_data[user_id]['current_chat']['name'] if user_data[user_id]['current_chat'] else 'Нет чата'}\n\n"
+        f"Выбери действие:"
     )
     
     try:
-        # Отправляем приветственное сообщение
         msg = await update.message.reply_text(
             welcome_text,
             reply_markup=get_main_keyboard(user_id),
@@ -268,35 +497,56 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для просмотра статуса бота"""
     try:
-        # Получаем аптайм бота
+        user_id = update.effective_user.id
+        await delete_menu(user_id, context)
+        
+        if user_id not in user_data:
+            init_user_data(user_id)
+        
         uptime_seconds = int(time.time() - bot_start_time)
         uptime_string = str(datetime.timedelta(seconds=uptime_seconds))
         
-        # Получаем информацию о пользователе
-        user_id = update.effective_user.id
         user_name = update.effective_user.first_name
         
-        # Статистика
         total_users = len(user_data)
         active_users = sum(1 for data in user_data.values() if data.get("in_dialog", False))
         
-        # Информация о системе
         python_version = sys.version.split()[0]
+        
+        user_total_msgs = user_data[user_id].get("total_messages", 0)
+        current_mode = MODES[user_data[user_id]["mode"]]["name"]
+        current_model = get_model_name(user_data[user_id]["model"])
+        current_chat = user_data[user_id]["current_chat"]["name"] if user_data[user_id]["current_chat"] else "Нет чата"
+        
+        permanent_chats = len([c for c in user_data[user_id]["chats"] if not c.get("is_temporary", False)])
+        liked_count = len(liked_messages.get(user_id, []))
         
         status_text = (
             f"🤖 **Статус бота**\n\n"
             f"⏱ **Аптайм:** {uptime_string}\n"
-            f"📊 **Версия:** 2.0\n"
+            f"📊 **Версия:** 3.0\n"
             f"🐍 **Python:** {python_version}\n\n"
-            f"📈 **Статистика:**\n"
+            f"📈 **Общая статистика:**\n"
             f"• Всего пользователей: {total_users}\n"
             f"• Активных диалогов: {active_users}\n\n"
             f"👤 **Ваш профиль:**\n"
             f"• ID: `{user_id}`\n"
-            f"• Имя: {user_name}"
+            f"• Имя: {user_name}\n"
+            f"• Режим: {current_mode}\n"
+            f"• Модель: {current_model}\n"
+            f"• Текущий чат: {current_chat}\n"
+            f"• Всего сообщений: {user_total_msgs}\n"
+            f"• Постоянных чатов: {permanent_chats}/{MAX_CHATS}\n"
+            f"• Сохранено сообщений: {liked_count}"
         )
         
-        await update.message.reply_text(status_text, parse_mode='Markdown')
+        msg = await update.message.reply_text(
+            status_text, 
+            parse_mode='Markdown',
+            reply_markup=get_back_to_menu_keyboard()
+        )
+        menu_messages[user_id] = msg.message_id
+        
     except Exception as e:
         logger.error(f"Ошибка в status: {e}")
         await update.message.reply_text("❌ Ошибка при получении статуса")
@@ -306,17 +556,18 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     start_time = time.time()
     
-    # Отправляем сообщение о начале проверки
+    await delete_menu(user_id, context)
+    
+    if user_id not in user_data:
+        init_user_data(user_id)
+    
     status_msg = await update.message.reply_text("🔄 Проверка скорости...")
     
     try:
-        # Проверяем задержку Telegram API
         telegram_ping = time.time() - start_time
         
-        # Проверяем скорость ответа Groq API
         groq_start = time.time()
         
-        # Используем простой синхронный вызов в отдельном потоке
         loop = asyncio.get_event_loop()
         test_response = await loop.run_in_executor(
             None,
@@ -331,11 +582,9 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         groq_time = time.time() - groq_start
         total_time = time.time() - start_time
         
-        # Получаем информацию о модели
         current_model = user_data.get(user_id, {}).get("model", DEFAULT_MODEL)
         model_name = get_model_name(current_model)
         
-        # Форматируем время
         result_text = (
             f"📊 **Результаты проверки скорости:**\n\n"
             f"⏱ **Общее время:** `{total_time:.2f} сек`\n"
@@ -346,7 +595,12 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"**Тестовый ответ:**\n{test_response.choices[0].message.content}"
         )
         
-        await status_msg.edit_text(result_text, parse_mode='Markdown')
+        await status_msg.edit_text(
+            result_text, 
+            parse_mode='Markdown',
+            reply_markup=get_back_to_menu_keyboard()
+        )
+        menu_messages[user_id] = status_msg.message_id
         
     except Exception as e:
         logger.error(f"Ошибка в ping: {e}")
@@ -358,9 +612,19 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💡 Возможно, проблема с сетью"
         )
         try:
-            await status_msg.edit_text(error_text, parse_mode='Markdown')
+            await status_msg.edit_text(
+                error_text, 
+                parse_mode='Markdown',
+                reply_markup=get_back_to_menu_keyboard()
+            )
+            menu_messages[user_id] = status_msg.message_id
         except:
-            await update.message.reply_text(error_text, parse_mode='Markdown')
+            msg = await update.message.reply_text(
+                error_text, 
+                parse_mode='Markdown',
+                reply_markup=get_back_to_menu_keyboard()
+            )
+            menu_messages[user_id] = msg.message_id
 
 def get_model_name(model_id):
     for name, mid in MODELS.items():
@@ -373,13 +637,100 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_message = update.message.text
     
-    # Проверяем, не является ли сообщение командой завершения
+    # Сохраняем ID сообщения пользователя
+    if user_id not in dialog_messages:
+        dialog_messages[user_id] = []
+    dialog_messages[user_id].append(update.message.message_id)
+    
+    # Проверяем, не является ли сообщение командой
+    if user_message == "👤 СОХРАНИТЬ МОЁ":
+        if user_id in last_user_message_index and last_user_message_index[user_id] != -1:
+            success, message = like_message(user_id, last_user_message_index[user_id], is_user_message=True)
+            await update.message.reply_text(message)
+        else:
+            await update.message.reply_text("❌ Нет вашего сообщения для сохранения")
+        return
+    
+    if user_message == "🤖 СОХРАНИТЬ БОТА":
+        if user_id in last_bot_message_index and last_bot_message_index[user_id] != -1:
+            success, message = like_message(user_id, last_bot_message_index[user_id], is_user_message=False)
+            await update.message.reply_text(message)
+        else:
+            await update.message.reply_text("❌ Нет сообщения бота для сохранения")
+        return
+    
+    if user_message == "❤️ МОЁ ИЗБРАННОЕ":
+        await show_liked_messages(update, context, user_id)
+        return
+    
     if user_message == "❌ ЗАВЕРШИТЬ ДИАЛОГ":
         await end_dialog(update, context)
         return
     
-    # Удаляем предыдущее меню если оно было
+    # Проверяем, не ожидаем ли мы ввод названия чата
+    if user_id in awaiting_input and awaiting_input[user_id].get("action") == "new_chat_name":
+        action_data = awaiting_input[user_id]
+        del awaiting_input[user_id]
+        
+        chat_type = action_data.get("chat_type")
+        
+        if chat_type == "permanent":
+            # Проверяем лимит
+            permanent_chats = [c for c in user_data[user_id]["chats"] if not c.get("is_temporary", False)]
+            if len(permanent_chats) >= MAX_CHATS:
+                # Предлагаем удалить старый чат
+                keyboard = [
+                    [InlineKeyboardButton("🗑 Удалить самый старый чат", callback_data="delete_oldest_and_create")],
+                    [InlineKeyboardButton("◀️ Отмена", callback_data="back_to_main")]
+                ]
+                await update.message.reply_text(
+                    f"❌ Достигнут лимит постоянных чатов ({MAX_CHATS}).\n\n"
+                    f"Хотите удалить самый старый чат и создать новый?",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            chat_id, error = create_chat(user_id, user_message[:50], is_temporary=False)
+            if chat_id:
+                await update.message.reply_text(
+                    f"✅ Постоянный чат '{user_message[:50]}' создан!",
+                    reply_markup=get_main_keyboard(user_id)
+                )
+            else:
+                await update.message.reply_text(f"❌ {error}")
+        
+        elif chat_type == "temporary":
+            if user_data[user_id]["temp_chat"]:
+                # Спрашиваем, заменить ли временный чат
+                keyboard = [
+                    [InlineKeyboardButton("✅ Заменить", callback_data="replace_temp_chat")],
+                    [InlineKeyboardButton("◀️ Отмена", callback_data="back_to_main")]
+                ]
+                await update.message.reply_text(
+                    "У вас уже есть временный чат. Заменить его?",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                awaiting_input[user_id] = {"action": "confirm_replace_temp", "name": user_message[:50]}
+            else:
+                chat_id, error = create_chat(user_id, user_message[:50], is_temporary=True)
+                if chat_id:
+                    await update.message.reply_text(
+                        f"✅ Временный чат '{user_message[:50]}' создан!",
+                        reply_markup=get_main_keyboard(user_id)
+                    )
+        
+        return
+    
     await delete_menu(user_id, context)
+    
+    if user_id not in user_data:
+        init_user_data(user_id)
+        create_chat(user_id, "Основной чат", is_temporary=False)
+    
+    # Проверяем, есть ли активный чат
+    if not user_data[user_id]["current_chat"]:
+        # Если нет активного чата, создаем временный
+        create_chat(user_id, "Временный чат", is_temporary=True)
     
     # Проверка на спам
     current_time = time.time()
@@ -387,29 +738,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_last_message[user_id] = current_time
     
-    # Инициализация данных пользователя
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "model": DEFAULT_MODEL,
-            "mode": DEFAULT_MODE,
-            "history": [{"role": "system", "content": MODES[DEFAULT_MODE]["system_prompt"]}],
-            "in_dialog": True,
-            "showing_end_button": False
-        }
-    else:
-        user_data[user_id]["in_dialog"] = True
+    user_data[user_id]["in_dialog"] = True
     
-    # Отправляем индикатор печатания
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
     try:
-        history = user_data[user_id]["history"]
+        current_chat = user_data[user_id]["current_chat"]
+        history = current_chat["messages"]
         history.append({"role": "user", "content": user_message})
         
-        if len(history) > 11:
-            history[:] = [history[0]] + history[-10:]
+        user_data[user_id]["total_messages"] = user_data[user_id].get("total_messages", 0) + 1
         
-        # Используем отдельный поток для запроса к Groq
+        # Сохраняем индекс сообщения пользователя
+        user_message_index = len([m for m in history if m["role"] != "system"]) - 1
+        last_user_message_index[user_id] = user_message_index
+        
+        if len(history) > 51:
+            history[:] = [history[0]] + history[-50:]
+        
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
@@ -423,41 +769,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         assistant_message = response.choices[0].message.content
         history.append({"role": "assistant", "content": assistant_message})
+        bot_message_index = len([m for m in history if m["role"] != "system"]) - 1
+        
+        # Сохраняем индексы последних сообщений
+        last_bot_message_index[user_id] = bot_message_index
+        last_message_index[user_id] = bot_message_index
         
         # Отправляем ответ
-        await update.message.reply_text(assistant_message)
+        sent_message = await update.message.reply_text(assistant_message)
         
-        # Показываем кнопку завершения если еще не показывали
-        if not user_data[user_id]["showing_end_button"]:
-            menu_text = (
-                f"⚡ **Меню диалога**\n\n"
-                f"Продолжай общение или нажми кнопку ниже, чтобы завершить диалог."
-            )
-            msg = await context.bot.send_message(
+        # Сохраняем ID сообщения бота
+        dialog_messages[user_id].append(sent_message.message_id)
+        
+        # Показываем клавиатуру с действиями
+        if not user_data[user_id]["showing_action_buttons"]:
+            action_message = await context.bot.send_message(
                 chat_id=user_id,
-                text=menu_text,
-                reply_markup=get_end_dialog_keyboard(),
-                parse_mode='Markdown'
+                text="Выбери действие:",
+                reply_markup=get_action_keyboard()
             )
-            user_data[user_id]["showing_end_button"] = True
+            dialog_messages[user_id].append(action_message.message_id)
+            user_data[user_id]["showing_action_buttons"] = True
             
     except Exception as e:
         logger.error(f"Ошибка при обработке сообщения: {e}")
         error_message = "❌ Ошибка при получении ответа. "
         
         if "timeout" in str(e).lower():
-            error_message += "Превышено время ожидания. Попробуйте позже."
+            error_message += "Превышено время ожидания."
         elif "connection" in str(e).lower():
-            error_message += "Проблема с подключением к API."
+            error_message += "Проблема с подключением."
         else:
-            error_message += f"Попробуйте позже."
+            error_message += "Попробуйте позже."
         
         await update.message.reply_text(error_message)
+
+async def show_liked_messages(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Показать избранные сообщения"""
+    if user_id not in liked_messages or not liked_messages[user_id]:
+        await update.message.reply_text(
+            "❤️ **Избранное**\n\nУ вас пока нет сохраненных сообщений.",
+            reply_markup=get_back_to_menu_keyboard(),
+            parse_mode='Markdown'
+        )
+        return
+    
+    keyboard = get_liked_messages_keyboard(user_id, 0)
+    if keyboard:
+        await update.message.reply_text(
+            "❤️ **Избранное**\n\nВыберите сообщение для просмотра:",
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка фотографий"""
     user_id = update.effective_user.id
     await delete_menu(user_id, context)
+    
+    if user_id not in user_data:
+        init_user_data(user_id)
     
     await update.message.reply_text(
         "📸 **Бот не умеет анализировать фото**\n\n"
@@ -469,35 +840,46 @@ async def end_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Завершение диалога"""
     user_id = update.effective_user.id
     
-    if user_id in user_data:
-        current_mode = user_data[user_id]["mode"]
-        user_data[user_id]["history"] = [{"role": "system", "content": MODES[current_mode]["system_prompt"]}]
-        user_data[user_id]["in_dialog"] = False
-        user_data[user_id]["showing_end_button"] = False
+    # Сначала удаляем все сообщения в диалоге
+    await delete_dialog_messages(user_id, context)
     
-    # Убираем клавиатуру
-    try:
-        await update.message.reply_text(
-            "✅ Диалог завершен",
-            reply_markup=ReplyKeyboardRemove()
-        )
-    except:
-        pass
+    if user_id in user_data:
+        current_chat = user_data[user_id]["current_chat"]
+        
+        # Если это временный чат - удаляем
+        if current_chat and current_chat.get("is_temporary"):
+            user_data[user_id]["temp_chat"] = None
+            user_data[user_id]["current_chat"] = None
+            user_data[user_id]["current_chat_id"] = None
+            user_data[user_id]["showing_action_buttons"] = False
+            last_message_index[user_id] = -1
+            last_user_message_index[user_id] = -1
+            last_bot_message_index[user_id] = -1
+            
+            # Отправляем только одно сообщение о завершении
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="✅ Временный чат завершен и удален.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        else:
+            user_data[user_id]["in_dialog"] = False
+            user_data[user_id]["showing_action_buttons"] = False
+            last_message_index[user_id] = -1
+            last_user_message_index[user_id] = -1
+            last_bot_message_index[user_id] = -1
+            
+            # Отправляем только одно сообщение о завершении
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="✅ Диалог завершен. История сохранена.",
+                reply_markup=ReplyKeyboardRemove()
+            )
     
     # Возвращаем главное меню
-    uptime_seconds = int(time.time() - bot_start_time)
-    uptime_string = str(datetime.timedelta(seconds=uptime_seconds))
-    
     msg = await context.bot.send_message(
         chat_id=user_id,
-        text=(
-            f"✅ **Диалог завершен!**\n\n"
-            f"История очищена.\n"
-            f"Текущие настройки:\n"
-            f"• Режим: {MODES[user_data[user_id]['mode']]['name']}\n"
-            f"• Модель: {get_model_name(user_data[user_id]['model'])}\n\n"
-            f"⏱ **Аптайм:** {uptime_string}"
-        ),
+        text="👋 **Главное меню**\n\nВыбери действие:",
         reply_markup=get_main_keyboard(user_id),
         parse_mode='Markdown'
     )
@@ -511,21 +893,290 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         user_id = query.from_user.id
         
+        if user_id not in user_data:
+            init_user_data(user_id)
+            create_chat(user_id, "Основной чат", is_temporary=False)
+        
         if query.data == "ignore":
-            await query.message.delete()
-            if user_id in menu_messages:
-                del menu_messages[user_id]
             return
         
-        if user_id not in user_data:
-            user_data[user_id] = {
-                "model": DEFAULT_MODEL,
-                "mode": DEFAULT_MODE,
-                "history": [{"role": "system", "content": MODES[DEFAULT_MODE]["system_prompt"]}],
-                "in_dialog": False,
-                "showing_end_button": False
-            }
+        # Обработка навигационных кнопок
+        if query.data == "back_to_main":
+            await query.edit_message_text(
+                "👋 **Главное меню**\n\nВыбери действие:",
+                reply_markup=get_main_keyboard(user_id),
+                parse_mode='Markdown'
+            )
+            menu_messages[user_id] = query.message.message_id
+            return
         
+        # Показ информации
+        if query.data == "show_info":
+            mode_name = MODES[user_data[user_id]["mode"]]["name"]
+            model_name = get_model_name(user_data[user_id]["model"])
+            current_chat = user_data[user_id]["current_chat"]
+            
+            if current_chat:
+                chat_msgs = len([m for m in current_chat["messages"] if m["role"] != "system"])
+                chat_name = current_chat["name"]
+                chat_type = "Временный" if current_chat.get("is_temporary") else "Постоянный"
+            else:
+                chat_msgs = 0
+                chat_name = "Нет чата"
+                chat_type = "Нет"
+            
+            total_msgs = user_data[user_id].get("total_messages", 0)
+            permanent_chats = len([c for c in user_data[user_id]["chats"] if not c.get("is_temporary", False)])
+            liked_count = len(liked_messages.get(user_id, []))
+            saved_limit = user_data[user_id]["saved_messages_limit"]
+            auto_delete = "Вкл" if user_data[user_id]["auto_delete"] else "Выкл"
+            
+            uptime_seconds = int(time.time() - bot_start_time)
+            uptime_string = str(datetime.timedelta(seconds=uptime_seconds))
+            
+            text = (
+                f"ℹ️ **Информация**\n\n"
+                f"👤 Пользователь: {query.from_user.first_name}\n\n"
+                f"🎭 **Текущие настройки:**\n"
+                f"• Режим: {mode_name}\n"
+                f"• Модель: {model_name}\n\n"
+                f"💬 **Текущий чат:**\n"
+                f"• Название: {chat_name}\n"
+                f"• Тип: {chat_type}\n"
+                f"• Сообщений: {chat_msgs}\n\n"
+                f"📊 **Статистика:**\n"
+                f"• Всего сообщений: {total_msgs}\n"
+                f"• Постоянных чатов: {permanent_chats}/{MAX_CHATS}\n"
+                f"• Сохранено сообщений: {liked_count}/{saved_limit}\n"
+                f"• Автоудаление: {auto_delete}\n\n"
+                f"⚙️ **Настройки:**\n"
+                f"• /setlimit N - установить лимит сохранения\n"
+                f"• /autodelete - вкл/выкл автоудаление\n"
+                f"• /clearliked - очистить избранное\n\n"
+                f"⏱ **Аптайм:** {uptime_string}"
+            )
+            
+            keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+        
+        # Показ списка чатов
+        if query.data == "show_chats":
+            keyboard = []
+            
+            # Постоянные чаты
+            permanent_chats = [c for c in user_data[user_id]["chats"] if not c.get("is_temporary", False)]
+            if permanent_chats:
+                for chat in permanent_chats:
+                    mark = "✅ " if user_data[user_id]["current_chat_id"] == chat["id"] else ""
+                    msg_count = len([m for m in chat["messages"] if m["role"] != "system"])
+                    liked_count = len(chat.get("liked_messages", []))
+                    btn_text = f"{mark}{chat['name']} ({msg_count} сообщ., {liked_count}❤️)"
+                    keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"view_chat_{chat['id']}")])
+            
+            # Временный чат
+            if user_data[user_id]["temp_chat"]:
+                temp_chat = user_data[user_id]["temp_chat"]
+                mark = "✅ " if user_data[user_id]["current_chat_id"] == temp_chat["id"] else ""
+                msg_count = len([m for m in temp_chat["messages"] if m["role"] != "system"])
+                liked_count = len(temp_chat.get("liked_messages", []))
+                btn_text = f"{mark}⏳ {temp_chat['name']} ({msg_count} сообщ., {liked_count}❤️)"
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"view_chat_{temp_chat['id']}")])
+            
+            # Кнопки создания
+            action_buttons = []
+            action_buttons.append(InlineKeyboardButton("➕ Постоянный", callback_data="new_permanent_chat"))
+            action_buttons.append(InlineKeyboardButton("⏳ Временный", callback_data="new_temp_chat"))
+            keyboard.append(action_buttons)
+            
+            keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+            
+            text = f"📋 **Мои чаты**\n\nВсего постоянных: {len(permanent_chats)}/{MAX_CHATS}"
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Просмотр чата
+        if query.data.startswith("view_chat_"):
+            chat_id = query.data.replace("view_chat_", "")
+            if switch_chat(user_id, chat_id):
+                chat = user_data[user_id]["current_chat"]
+                messages = [m for m in chat["messages"] if m["role"] != "system"]
+                
+                if messages:
+                    text = f"📜 **История чата: {chat['name']}**\n\n"
+                    for i, msg in enumerate(messages[-10:]):
+                        role_emoji = "👤" if msg["role"] == "user" else "🤖"
+                        actual_index = len(messages) - 10 + i
+                        msg_id = f"{chat['id']}_{actual_index}"
+                        is_liked = msg_id in chat.get("liked_messages", [])
+                        like_mark = " ❤️" if is_liked else ""
+                        text += f"**{actual_index+1}.** {role_emoji} {msg['content'][:100]}{like_mark}\n\n"
+                else:
+                    text = f"📭 **История чата: {chat['name']}**\n\nНет сообщений."
+                
+                keyboard = [[InlineKeyboardButton("◀️ Назад к чатам", callback_data="show_chats")]]
+                await query.edit_message_text(
+                    text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+            return
+        
+        # Создание постоянного чата
+        if query.data == "new_permanent_chat":
+            permanent_chats = [c for c in user_data[user_id]["chats"] if not c.get("is_temporary", False)]
+            if len(permanent_chats) >= MAX_CHATS:
+                keyboard = [
+                    [InlineKeyboardButton("🗑 Удалить самый старый", callback_data="delete_oldest_and_create")],
+                    [InlineKeyboardButton("◀️ Отмена", callback_data="back_to_main")]
+                ]
+                await query.edit_message_text(
+                    f"❌ Достигнут лимит постоянных чатов ({MAX_CHATS}).\n\n"
+                    f"Удалить самый старый чат и создать новый?",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            awaiting_input[user_id] = {"action": "new_chat_name", "chat_type": "permanent"}
+            await query.edit_message_text(
+                "📝 **Введите название для нового постоянного чата:**",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Отмена", callback_data="back_to_main")
+                ]]),
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Создание временного чата
+        if query.data == "new_temp_chat":
+            if user_data[user_id]["temp_chat"]:
+                keyboard = [
+                    [InlineKeyboardButton("✅ Да, заменить", callback_data="confirm_replace_temp")],
+                    [InlineKeyboardButton("◀️ Отмена", callback_data="back_to_main")]
+                ]
+                await query.edit_message_text(
+                    "У вас уже есть временный чат. Заменить его?",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            awaiting_input[user_id] = {"action": "new_chat_name", "chat_type": "temporary"}
+            await query.edit_message_text(
+                "📝 **Введите название для временного чата:**",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Отмена", callback_data="back_to_main")
+                ]]),
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Удаление старого чата и создание нового
+        if query.data == "delete_oldest_and_create":
+            if delete_oldest_chat(user_id):
+                awaiting_input[user_id] = {"action": "new_chat_name", "chat_type": "permanent"}
+                await query.edit_message_text(
+                    "✅ Самый старый чат удален.\n\n📝 **Введите название для нового чата:**",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ Отмена", callback_data="back_to_main")
+                    ]]),
+                    parse_mode='Markdown'
+                )
+            return
+        
+        # Подтверждение замены временного чата
+        if query.data == "confirm_replace_temp":
+            if "name" in awaiting_input.get(user_id, {}):
+                name = awaiting_input[user_id]["name"]
+                del awaiting_input[user_id]
+                chat_id, error = create_chat(user_id, name, is_temporary=True)
+                if chat_id:
+                    await query.edit_message_text(
+                        f"✅ Временный чат '{name}' создан!",
+                        reply_markup=get_main_keyboard(user_id)
+                    )
+            return
+        
+        # Просмотр сохраненных сообщений
+        if query.data.startswith("view_liked_"):
+            index = int(query.data.replace("view_liked_", ""))
+            if user_id in liked_messages and 0 <= index < len(liked_messages[user_id]):
+                msg = liked_messages[user_id][index]
+                role_text = "Вы" if msg.get("is_user") else "Бот"
+                role_emoji = "👤" if msg.get("is_user") else "🤖"
+                
+                text = (
+                    f"❤️ **Сохраненное сообщение**\n\n"
+                    f"Отправитель: {role_emoji} {role_text}\n"
+                    f"Чат: {msg['chat_name']}\n"
+                    f"Время: {datetime.datetime.fromtimestamp(msg['timestamp']).strftime('%d.%m.%Y %H:%M')}\n\n"
+                    f"**Текст:**\n{msg['message']}"
+                )
+                
+                keyboard = [
+                    [InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_liked_{index}")],
+                    [InlineKeyboardButton("◀️ Назад", callback_data="show_liked_page_0")]
+                ]
+                
+                await query.edit_message_text(
+                    text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+            return
+        
+        # Удаление из избранного
+        if query.data.startswith("delete_liked_"):
+            index = int(query.data.replace("delete_liked_", ""))
+            if user_id in liked_messages and 0 <= index < len(liked_messages[user_id]):
+                msg = liked_messages[user_id][index]
+                success, message = delete_liked_message(user_id, msg["id"])
+                await query.answer(message)
+                
+                if success:
+                    # Показываем обновленный список
+                    keyboard = get_liked_messages_keyboard(user_id, 0)
+                    if keyboard:
+                        await query.edit_message_text(
+                            "❤️ **Избранное**\n\nВыберите сообщение для просмотра:",
+                            reply_markup=keyboard,
+                            parse_mode='Markdown'
+                        )
+                    else:
+                        await query.edit_message_text(
+                            "❤️ **Избранное**\n\nУ вас пока нет сохраненных сообщений.",
+                            reply_markup=get_back_to_menu_keyboard(),
+                            parse_mode='Markdown'
+                        )
+            return
+        
+        # Навигация по страницам избранного
+        if query.data.startswith("liked_page_"):
+            page = int(query.data.replace("liked_page_", ""))
+            keyboard = get_liked_messages_keyboard(user_id, page)
+            if keyboard:
+                await query.edit_message_text(
+                    "❤️ **Избранное**\n\nВыберите сообщение для просмотра:",
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+            return
+        
+        if query.data.startswith("show_liked_page_"):
+            page = int(query.data.replace("show_liked_page_", ""))
+            keyboard = get_liked_messages_keyboard(user_id, page)
+            if keyboard:
+                await query.edit_message_text(
+                    "❤️ **Избранное**\n\nВыберите сообщение для просмотра:",
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+            return
+        
+        # Обработка меню режимов
         if query.data == "show_modes":
             keyboard = []
             for mode_id, mode_info in MODES.items():
@@ -545,7 +1196,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif query.data.startswith("mode_"):
             mode_id = query.data.replace("mode_", "")
             user_data[user_id]["mode"] = mode_id
-            user_data[user_id]["history"] = [{"role": "system", "content": MODES[mode_id]["system_prompt"]}]
+            
+            # Обновляем system prompt в текущем чате
+            if user_data[user_id]["current_chat"]:
+                user_data[user_id]["current_chat"]["messages"] = [
+                    {"role": "system", "content": MODES[mode_id]["system_prompt"]}
+                ]
+                user_data[user_id]["current_chat"]["mode"] = mode_id
             
             await query.edit_message_text(
                 f"✅ Режим изменен на {MODES[mode_id]['name']}",
@@ -553,6 +1210,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             menu_messages[user_id] = query.message.message_id
         
+        # Обработка меню моделей
         elif query.data == "show_models":
             keyboard = []
             for name, model_id in MODELS.items():
@@ -573,59 +1231,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model_id = query.data.replace("model_", "")
             user_data[user_id]["model"] = model_id
             
+            # Обновляем модель в текущем чате
+            if user_data[user_id]["current_chat"]:
+                user_data[user_id]["current_chat"]["model"] = model_id
+            
             await query.edit_message_text(
-                f"✅ Модель изменена",
+                f"✅ Модель изменена на {get_model_name(model_id)}",
                 reply_markup=get_main_keyboard(user_id)
-            )
-            menu_messages[user_id] = query.message.message_id
-        
-        elif query.data == "show_history":
-            history = user_data[user_id]["history"]
-            user_msgs = [msg for msg in history if msg["role"] == "user"]
-            
-            if user_msgs:
-                text = f"📋 **История**\n\nВсего сообщений: {len(user_msgs)}\n\nПоследние:\n"
-                for msg in history[-6:]:
-                    if msg["role"] == "user":
-                        text += f"👤 {msg['content'][:50]}...\n"
-                    elif msg["role"] == "assistant":
-                        text += f"🤖 {msg['content'][:50]}...\n"
-            else:
-                text = "📋 История пуста"
-            
-            keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        
-        elif query.data == "settings":
-            mode_name = MODES[user_data[user_id]["mode"]]["name"]
-            model_name = get_model_name(user_data[user_id]["model"])
-            history_len = len([msg for msg in user_data[user_id]["history"] if msg["role"] == "user"])
-            
-            uptime_seconds = int(time.time() - bot_start_time)
-            uptime_string = str(datetime.timedelta(seconds=uptime_seconds))
-            
-            text = (
-                f"ℹ️ **Информация**\n\n"
-                f"👤 Пользователь: {query.from_user.first_name}\n"
-                f"🎭 Режим: {mode_name}\n"
-                f"🚀 Модель: {model_name}\n"
-                f"💬 Сообщений: {history_len}\n\n"
-                f"⏱ **Аптайм:** {uptime_string}\n\n"
-                f"📌 **Режимы:**\n"
-                f"• 💬 Обычный - вежливые ответы\n"
-                f"• 😈 Хам - грубые и саркастичные\n"
-                f"• 🤬 Мат - с нецензурной лексикой"
-            )
-            
-            keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        
-        elif query.data == "back_to_main":
-            await query.edit_message_text(
-                f"⚡ **Главное меню**\n\n"
-                f"{MODES[user_data[user_id]['mode']]['name']} | {get_model_name(user_data[user_id]['model'])}",
-                reply_markup=get_main_keyboard(user_id),
-                parse_mode='Markdown'
             )
             menu_messages[user_id] = query.message.message_id
             
@@ -646,7 +1258,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Запуск бота"""
     try:
-        # Создаем приложение
         application = (
             ApplicationBuilder()
             .token(TELEGRAM_TOKEN)
@@ -666,13 +1277,11 @@ def main():
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        # Добавляем глобальный обработчик ошибок
         application.add_error_handler(error_handler)
         
         logger.info("Бот запускается...")
         logger.info(f"Время: {datetime.datetime.now()}")
         
-        # Запускаем бота
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
