@@ -8,7 +8,7 @@ import random
 import json
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ApplicationBuilder
@@ -28,6 +28,9 @@ GROQ_API_KEY = "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"
 # ID владельца (определится при первом запуске)
 OWNER_CHAT_ID = None
 
+# Список администраторов (username'ы)
+ADMINS = set()  # Например: {"username1", "username2"}
+
 # Глобальный клиент Groq
 groq_client = None
 
@@ -35,7 +38,7 @@ groq_client = None
 bot_paused = False
 pause_reason = ""
 
-# Настройки бота (доступны только владельцу)
+# Настройки бота (доступны только владельцу и админам)
 bot_settings = {
     "default_model": "llama-3.1-8b-instant",
     "default_mode": "normal",
@@ -160,6 +163,9 @@ weekly_active_users = set()
 monthly_active_users = set()
 bot_start_time = time.time()
 
+# Для сохранения сообщений по номерам
+pending_save = {}  # {user_id: {"type": "user"/"bot", "messages": list}}
+
 # Константы из настроек
 MAX_CHATS = bot_settings["max_chats"]
 MAX_SAVED_MESSAGES = bot_settings["max_saved_messages"]
@@ -181,6 +187,16 @@ ADULT_KEYWORDS = [
 # ----------------------------------------------------------------------
 # Вспомогательные функции
 # ----------------------------------------------------------------------
+def is_admin(user_id, username=None):
+    """Проверка, является ли пользователь администратором"""
+    # Владелец всегда админ
+    if user_id == OWNER_CHAT_ID:
+        return True
+    # Проверка по username
+    if username and username.lower() in ADMINS:
+        return True
+    return False
+
 def init_user_data(user_id):
     """Инициализация данных пользователя"""
     if user_id not in user_data:
@@ -210,6 +226,8 @@ def init_user_data(user_id):
                 "requests_per_minute": DEFAULT_REQUESTS_PER_MINUTE,
                 "cooldown": DEFAULT_COOLDOWN
             },
+            "message_style": bot_settings["message_style"],  # Личный стиль сообщения
+            "recent_messages": [],  # Последние сообщения для сохранения
         }
         dialog_messages[user_id] = []
         saved_messages[user_id] = []
@@ -223,7 +241,7 @@ def init_user_data(user_id):
                 "requests_per_hour": DEFAULT_REQUESTS_PER_HOUR,
                 "requests_per_day": DEFAULT_REQUESTS_PER_DAY,
                 "cooldown": DEFAULT_COOLDOWN,
-                "is_owner": False
+                "is_owner": (user_id == OWNER_CHAT_ID)
             }
 
         user_activity[user_id] = {
@@ -313,8 +331,8 @@ def check_request_limits(user_id):
     if bot_paused:
         return False, "⏸️ Бот временно приостановлен. Попробуйте позже."
     
-    # Владелец без лимитов
-    if user_limits.get(user_id, {}).get("is_owner"):
+    # Владелец и админы без лимитов
+    if user_limits.get(user_id, {}).get("is_owner") or is_admin(user_id):
         return True, "OK"
     
     # Используем персональные лимиты
@@ -402,6 +420,37 @@ def switch_chat(user_id, chat_id):
             return True
     return False
 
+def delete_chat(user_id, chat_id):
+    """Удаление чата по ID"""
+    if user_id not in user_data:
+        return False
+    
+    # Проверяем временный чат
+    if user_data[user_id]["temp_chat"] and user_data[user_id]["temp_chat"]["id"] == chat_id:
+        user_data[user_id]["temp_chat"] = None
+        if user_data[user_id]["current_chat_id"] == chat_id:
+            user_data[user_id]["current_chat"] = None
+            user_data[user_id]["current_chat_id"] = None
+        return True
+    
+    # Проверяем постоянные чаты
+    for i, chat in enumerate(user_data[user_id]["chats"]):
+        if chat["id"] == chat_id:
+            del user_data[user_id]["chats"][i]
+            if user_data[user_id]["current_chat_id"] == chat_id:
+                # Если удалили текущий чат, переключаемся на первый доступный
+                if user_data[user_id]["chats"]:
+                    user_data[user_id]["current_chat"] = user_data[user_id]["chats"][0]
+                    user_data[user_id]["current_chat_id"] = user_data[user_id]["chats"][0]["id"]
+                elif user_data[user_id]["temp_chat"]:
+                    user_data[user_id]["current_chat"] = user_data[user_id]["temp_chat"]
+                    user_data[user_id]["current_chat_id"] = user_data[user_id]["temp_chat"]["id"]
+                else:
+                    user_data[user_id]["current_chat"] = None
+                    user_data[user_id]["current_chat_id"] = None
+            return True
+    return False
+
 def delete_oldest_chat(user_id):
     if user_id not in user_data:
         return False
@@ -412,16 +461,20 @@ def delete_oldest_chat(user_id):
         return True
     return False
 
-def save_message(user_id, message_text, sender):
+def save_message(user_id, message_text, sender, chat_name=None):
     if user_id not in saved_messages:
         saved_messages[user_id] = []
     if len(saved_messages[user_id]) >= user_data[user_id]["saved_messages_limit"]:
         saved_messages[user_id].pop(0)
+    
+    if not chat_name and user_data[user_id]["current_chat"]:
+        chat_name = user_data[user_id]["current_chat"]["name"]
+    
     saved_messages[user_id].append({
         "text": message_text,
         "sender": sender,
         "timestamp": time.time(),
-        "chat_name": user_data[user_id]["current_chat"]["name"] if user_data[user_id]["current_chat"] else "Неизвестный чат"
+        "chat_name": chat_name or "Неизвестный чат"
     })
     return True
 
@@ -495,8 +548,13 @@ def update_bot_settings(new_settings):
     API_CALL_COOLDOWN = bot_settings["api_call_cooldown"]
 
 def format_welcome_message(user_id, first_name, chat_name):
-    """Форматирует приветственное сообщение согласно выбранному стилю"""
-    style = bot_settings.get("message_style", "standard")
+    """Форматирует приветственное сообщение согласно выбранному стилю пользователя"""
+    # Используем личный стиль пользователя или стандартный
+    if user_id in user_data and "message_style" in user_data[user_id]:
+        style = user_data[user_id]["message_style"]
+    else:
+        style = bot_settings.get("message_style", "standard")
+    
     template = MESSAGE_STYLES[style]["template"]
     
     # Получаем данные для подстановки
@@ -521,6 +579,26 @@ def format_welcome_message(user_id, first_name, chat_name):
         base += f"\n\n{bot_settings['custom_info']}"
     
     return base
+
+async def delete_all_messages(user_id, context, except_last=None):
+    """Удаляет все сообщения пользователя кроме указанного"""
+    if user_id in dialog_messages:
+        messages_to_delete = []
+        for msg_id in dialog_messages[user_id]:
+            if msg_id != except_last:
+                messages_to_delete.append(msg_id)
+        
+        for msg_id in messages_to_delete:
+            try:
+                await context.bot.delete_message(user_id, msg_id)
+                await asyncio.sleep(0.05)
+            except:
+                pass
+        
+        if except_last:
+            dialog_messages[user_id] = [except_last]
+        else:
+            dialog_messages[user_id] = []
 
 # ----------------------------------------------------------------------
 # Инициализация Groq клиента (только с фиксированным ключом)
@@ -560,6 +638,21 @@ async def notify_owner(context, message):
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление владельцу: {e}")
 
+async def notify_admins(context, message):
+    """Уведомление всех администраторов"""
+    if OWNER_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text=f"📢 **Уведомление администраторам**\n\n{message}",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+    
+    # Уведомление других админов по username (сложно, т.к. нужны chat_id)
+    # В реальном проекте нужно хранить соответствие username -> chat_id
+
 # ----------------------------------------------------------------------
 # Клавиатуры
 # ----------------------------------------------------------------------
@@ -573,17 +666,26 @@ def get_main_keyboard(user_id):
          InlineKeyboardButton("⚙️ Настройки", callback_data="show_settings")],
         [InlineKeyboardButton("ℹ️ Информация", callback_data="show_info")]
     ]
-    if user_limits.get(user_id, {}).get("is_owner"):
-        keyboard.append([InlineKeyboardButton("👑 Панель владельца", callback_data="owner_panel")])
+    if is_admin(user_id):
+        keyboard.append([InlineKeyboardButton("👑 Панель администратора", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_dialog_reply_keyboard():
-    """Reply-клавиатура для диалога (под строкой ввода)"""
+    """Reply-клавиатура для диалога (под строкой ввода) - только одна кнопка сохранения"""
     keyboard = [
-        ["📝 Сохранить ответ", "✏️ Сохранить запрос"],
+        ["💾 Сохранить"],
         ["❌ Завершить диалог", "📊 Статистика"]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+def get_save_menu_keyboard():
+    """Меню выбора что сохранить"""
+    keyboard = [
+        [InlineKeyboardButton("🤖 Сохранить ответ бота", callback_data="save_bot_response")],
+        [InlineKeyboardButton("👤 Сохранить мой запрос", callback_data="save_user_request")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data="cancel_save")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 # ----------------------------------------------------------------------
 # Удаление меню и сообщений
@@ -598,16 +700,8 @@ async def delete_all_menus(user_id, context):
             pass
         del menu_messages[user_id]
     
-    # Удаляем все сообщения в диалоге, кроме последнего
-    if user_id in dialog_messages and len(dialog_messages[user_id]) > 1:
-        messages_to_delete = dialog_messages[user_id][:-1]
-        for msg_id in messages_to_delete:
-            try:
-                await context.bot.delete_message(user_id, msg_id)
-                await asyncio.sleep(0.05)
-            except:
-                pass
-        dialog_messages[user_id] = dialog_messages[user_id][-1:]
+    # Удаляем все сообщения в диалоге
+    await delete_all_messages(user_id, context)
 
 async def delete_menu(user_id, context):
     """Удаляет только главное меню"""
@@ -617,18 +711,6 @@ async def delete_menu(user_id, context):
         except:
             pass
         del menu_messages[user_id]
-
-async def delete_dialog_messages(user_id, context):
-    """Удаляет все сообщения в диалоге, кроме последнего"""
-    if user_id in dialog_messages and len(dialog_messages[user_id]) > 1:
-        messages_to_delete = dialog_messages[user_id][:-1]
-        for msg_id in messages_to_delete:
-            try:
-                await context.bot.delete_message(user_id, msg_id)
-                await asyncio.sleep(0.05)
-            except:
-                pass
-        dialog_messages[user_id] = dialog_messages[user_id][-1:]
 
 # ----------------------------------------------------------------------
 # Команда /start
@@ -644,8 +726,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
         return
 
-    # Удаляем все старые меню
-    await delete_all_menus(user_id, context)
+    # Удаляем все старые сообщения
+    await delete_all_messages(user_id, context)
 
     if user_id not in user_data:
         init_user_data(user_id)
@@ -666,21 +748,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ **Бот успешно запущен!**\n\n"
                 "✨ **Доступные модели:**\n"
                 "• 🦙 LLaMA 3.1 8B\n• 🔸 Gemma 2 9B\n• 🦙 LLaMA 3.3 70B\n\n"
-                "🔑 **API ключ фиксированный, менять нельзя**"
+                "🔑 **API ключ фиксированный, менять нельзя**\n\n"
+                "👥 **Управление администраторами:**\n"
+                "• В панели администратора вы можете добавлять/удалять админов по username\n"
+                "• Главный администратор (вы) не может быть удален"
             )
             msg = await update.message.reply_text(
                 welcome_text,
                 reply_markup=get_main_keyboard(user_id)
             )
             menu_messages[user_id] = msg.message_id
+            dialog_messages[user_id] = [msg.message_id]
             return
 
-    # Формируем приветственное сообщение согласно стилю
+    # Формируем приветственное сообщение согласно личному стилю
     current_chat_name = user_data[user_id]["current_chat"]["name"]
     welcome = format_welcome_message(user_id, first_name, current_chat_name)
     
     msg = await update.message.reply_text(welcome, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
     menu_messages[user_id] = msg.message_id
+    dialog_messages[user_id] = [msg.message_id]
     user_data[user_id]["last_message_id"] = msg.message_id
 
 # ----------------------------------------------------------------------
@@ -706,25 +793,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Добавляем сообщение пользователя в список
     dialog_messages[user_id].append(update.message.message_id)
 
-    # Обработка кнопок reply-клавиатуры
-    if user_message == "📝 Сохранить ответ":
-        if user_data[user_id].get("last_bot_message"):
-            save_message(user_id, user_data[user_id]["last_bot_message"], "bot")
-            msg = await update.message.reply_text("✅ Ответ бота сохранен!")
-            dialog_messages[user_id].append(msg.message_id)
-        else:
-            msg = await update.message.reply_text("❌ Нет ответа для сохранения")
-            dialog_messages[user_id].append(msg.message_id)
-        return
+    # Сохраняем сообщение пользователя в историю последних сообщений
+    if "recent_messages" not in user_data[user_id]:
+        user_data[user_id]["recent_messages"] = []
     
-    if user_message == "✏️ Сохранить запрос":
-        if last_message_text.get(user_id, {}).get("user"):
-            save_message(user_id, last_message_text[user_id]["user"], "user")
-            msg = await update.message.reply_text("✅ Ваш запрос сохранен!")
-            dialog_messages[user_id].append(msg.message_id)
-        else:
-            msg = await update.message.reply_text("❌ Нет запроса для сохранения")
-            dialog_messages[user_id].append(msg.message_id)
+    user_data[user_id]["recent_messages"].append({
+        "text": user_message,
+        "sender": "user",
+        "timestamp": time.time()
+    })
+    # Оставляем только последние 20 сообщений
+    if len(user_data[user_id]["recent_messages"]) > 20:
+        user_data[user_id]["recent_messages"] = user_data[user_id]["recent_messages"][-20:]
+
+    # Обработка ожидаемого ввода (выбор номера сообщения для сохранения)
+    if user_id in pending_save:
+        await handle_save_number_selection(update, context, user_id, user_message)
+        return
+
+    # Обработка кнопок reply-клавиатуры
+    if user_message == "💾 Сохранить":
+        # Показываем меню выбора что сохранить
+        save_menu_msg = await update.message.reply_text(
+            "💾 **Что хотите сохранить?**",
+            reply_markup=get_save_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+        dialog_messages[user_id].append(save_menu_msg.message_id)
         return
     
     if user_message == "❌ Завершить диалог":
@@ -756,7 +851,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_awaiting_input(update, context, user_id, user_message)
         return
 
-    # Удаляем главное меню перед отправкой запроса (оно больше не нужно)
+    # Удаляем главное меню перед отправкой запроса
     await delete_menu(user_id, context)
 
     if user_id not in user_data:
@@ -877,12 +972,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_message_text[user_id]["bot"] = assistant_message
         user_data[user_id]["last_bot_message"] = assistant_message
 
+        # Сохраняем ответ бота в историю последних сообщений
+        user_data[user_id]["recent_messages"].append({
+            "text": assistant_message,
+            "sender": "bot",
+            "timestamp": time.time()
+        })
+        if len(user_data[user_id]["recent_messages"]) > 20:
+            user_data[user_id]["recent_messages"] = user_data[user_id]["recent_messages"][-20:]
+
         # С вероятностью 10% добавляем цитату
         if random.random() < 0.1:
             assistant_message += f"\n\n— — — — — — — — — — — — — — —\n{get_random_quote()}"
 
-        # Удаляем старые сообщения перед отправкой нового (кроме последнего)
-        await delete_dialog_messages(user_id, context)
+        # Удаляем все старые сообщения перед отправкой нового
+        await delete_all_messages(user_id, context)
 
         # Отправляем новый ответ
         sent = await update.message.reply_text(
@@ -904,6 +1008,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Завершить диалог", callback_data="end_dialog")]])
         )
         dialog_messages[user_id].append(error_msg.message_id)
+
+# ----------------------------------------------------------------------
+# Обработка выбора номера сообщения для сохранения
+# ----------------------------------------------------------------------
+async def handle_save_number_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, user_message: str):
+    """Обработка выбора номера сообщения для сохранения"""
+    try:
+        number = int(user_message.strip())
+        save_info = pending_save[user_id]
+        messages = save_info["messages"]
+        
+        if 1 <= number <= len(messages):
+            selected_msg = messages[number - 1]
+            sender = save_info["type"]
+            
+            # Сохраняем сообщение
+            save_message(user_id, selected_msg["text"], sender)
+            
+            await update.message.reply_text(
+                f"✅ **Сообщение сохранено!**\n\n"
+                f"Текст: {selected_msg['text'][:100]}...",
+                parse_mode="Markdown"
+            )
+            
+            # Удаляем информацию о pending save
+            del pending_save[user_id]
+        else:
+            await update.message.reply_text(
+                f"❌ Неверный номер. Введите число от 1 до {len(messages)}",
+                reply_markup=ReplyKeyboardMarkup([["◀️ Отмена"]], resize_keyboard=True)
+            )
+    except ValueError:
+        if user_message.strip() == "◀️ Отмена":
+            del pending_save[user_id]
+            await update.message.reply_text("❌ Сохранение отменено")
+        else:
+            await update.message.reply_text(
+                "❌ Пожалуйста, введите номер сообщения или нажмите '◀️ Отмена'",
+                reply_markup=ReplyKeyboardMarkup([["◀️ Отмена"]], resize_keyboard=True)
+            )
 
 # ----------------------------------------------------------------------
 # Обработчик ожидаемого ввода
@@ -931,12 +1075,13 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             chat_id, error = create_chat(user_id, user_message[:50], is_temporary=False)
             if chat_id:
                 # После создания чата показываем главное меню
-                await delete_all_menus(user_id, context)
+                await delete_all_messages(user_id, context)
                 first_name = update.effective_user.first_name
                 current_chat_name = user_data[user_id]["current_chat"]["name"]
                 welcome = format_welcome_message(user_id, first_name, current_chat_name)
                 msg = await update.message.reply_text(f"✅ Постоянный чат '{user_message[:50]}' создан!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
             else:
                 msg = await update.message.reply_text(f"❌ {error}")
                 dialog_messages[user_id].append(msg.message_id)
@@ -952,12 +1097,13 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             else:
                 chat_id, error = create_chat(user_id, user_message[:50], is_temporary=True)
                 if chat_id:
-                    await delete_all_menus(user_id, context)
+                    await delete_all_messages(user_id, context)
                     first_name = update.effective_user.first_name
                     current_chat_name = user_data[user_id]["current_chat"]["name"]
                     welcome = format_welcome_message(user_id, first_name, current_chat_name)
                     msg = await update.message.reply_text(f"✅ Временный чат '{user_message[:50]}' создан!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                     menu_messages[user_id] = msg.message_id
+                    dialog_messages[user_id] = [msg.message_id]
         return
 
     elif action_data.get("action") == "message_to_owner":
@@ -974,16 +1120,18 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode='Markdown'
                 )
                 # Возвращаемся в главное меню
-                await delete_all_menus(user_id, context)
+                await delete_all_messages(user_id, context)
                 first_name = update.effective_user.first_name
                 current_chat_name = user_data[user_id]["current_chat"]["name"]
                 welcome = format_welcome_message(user_id, first_name, current_chat_name)
                 msg = await update.message.reply_text("✅ **Сообщение отправлено владельцу!**\n\nОн ответит вам, как только сможет.\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
             except Exception as e:
                 logger.error(f"Ошибка при отправке сообщения владельцу: {e}")
                 msg = await update.message.reply_text("❌ Не удалось отправить сообщение. Попробуйте позже.", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
         return
 
     elif action_data.get("action") == "set_custom_note":
@@ -996,12 +1144,13 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             user_data[user_id]["current_chat"]["messages"][0]["content"] = system_prompt
         
         # Возвращаемся в главное меню
-        await delete_all_menus(user_id, context)
+        await delete_all_messages(user_id, context)
         first_name = update.effective_user.first_name
         current_chat_name = user_data[user_id]["current_chat"]["name"]
         welcome = format_welcome_message(user_id, first_name, current_chat_name)
         msg = await update.message.reply_text(f"✅ Ваша приписка сохранена!\n\nТеперь бот будет учитывать: {user_message}\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
         menu_messages[user_id] = msg.message_id
+        dialog_messages[user_id] = [msg.message_id]
         return
 
     elif action_data.get("action") == "set_personal_rpm":
@@ -1010,12 +1159,13 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             limit = int(user_message)
             if 1 <= limit <= 60:
                 user_data[user_id]["personal_limits"]["requests_per_minute"] = limit
-                await delete_all_menus(user_id, context)
+                await delete_all_messages(user_id, context)
                 first_name = update.effective_user.first_name
                 current_chat_name = user_data[user_id]["current_chat"]["name"]
                 welcome = format_welcome_message(user_id, first_name, current_chat_name)
                 msg = await update.message.reply_text(f"✅ Ваш лимит запросов установлен: {limit} в минуту\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
             else:
                 msg = await update.message.reply_text("❌ Лимит должен быть от 1 до 60")
                 dialog_messages[user_id].append(msg.message_id)
@@ -1030,12 +1180,13 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             cd = int(user_message)
             if 1 <= cd <= 10:
                 user_data[user_id]["personal_limits"]["cooldown"] = cd
-                await delete_all_menus(user_id, context)
+                await delete_all_messages(user_id, context)
                 first_name = update.effective_user.first_name
                 current_chat_name = user_data[user_id]["current_chat"]["name"]
                 welcome = format_welcome_message(user_id, first_name, current_chat_name)
                 msg = await update.message.reply_text(f"✅ Ваш cooldown установлен: {cd} сек\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
             else:
                 msg = await update.message.reply_text("❌ Cooldown должен быть от 1 до 10 сек")
                 dialog_messages[user_id].append(msg.message_id)
@@ -1044,8 +1195,72 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             dialog_messages[user_id].append(msg.message_id)
         return
 
+    elif action_data.get("action") == "set_message_style":
+        del awaiting_input[user_id]
+        style = user_message.strip().lower()
+        if style in MESSAGE_STYLES:
+            user_data[user_id]["message_style"] = style
+            await delete_all_messages(user_id, context)
+            first_name = update.effective_user.first_name
+            current_chat_name = user_data[user_id]["current_chat"]["name"]
+            welcome = format_welcome_message(user_id, first_name, current_chat_name)
+            msg = await update.message.reply_text(f"✅ Ваш стиль сообщения изменен на {MESSAGE_STYLES[style]['name']}!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
+            menu_messages[user_id] = msg.message_id
+            dialog_messages[user_id] = [msg.message_id]
+        else:
+            styles_list = ", ".join([f"'{s}'" for s in MESSAGE_STYLES.keys()])
+            msg = await update.message.reply_text(f"❌ Неверный стиль. Доступны: {styles_list}")
+            dialog_messages[user_id].append(msg.message_id)
+        return
+
     # Административные настройки
-    elif action_data.get("action") == "set_cooldown" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "add_admin" and is_admin(user_id):
+        del awaiting_input[user_id]
+        username = user_message.strip()
+        if username.startswith('@'):
+            username = username[1:]
+        
+        # Добавляем в множество администраторов
+        ADMINS.add(username.lower())
+        
+        await delete_all_messages(user_id, context)
+        first_name = update.effective_user.first_name
+        current_chat_name = user_data[user_id]["current_chat"]["name"]
+        welcome = format_welcome_message(user_id, first_name, current_chat_name)
+        msg = await update.message.reply_text(f"✅ Пользователь @{username} добавлен в администраторы!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
+        menu_messages[user_id] = msg.message_id
+        dialog_messages[user_id] = [msg.message_id]
+        
+        # Уведомление владельцу
+        await notify_owner(context, f"Администратор @{username} добавлен пользователем {user_id}")
+        return
+
+    elif action_data.get("action") == "remove_admin" and is_admin(user_id):
+        del awaiting_input[user_id]
+        username = user_message.strip()
+        if username.startswith('@'):
+            username = username[1:]
+        
+        # Проверяем, не является ли это главным админом
+        owner_username = None
+        if user_id == OWNER_CHAT_ID and username:
+            owner_username = username
+        
+        if username.lower() in ADMINS:
+            ADMINS.remove(username.lower())
+            await delete_all_messages(user_id, context)
+            first_name = update.effective_user.first_name
+            current_chat_name = user_data[user_id]["current_chat"]["name"]
+            welcome = format_welcome_message(user_id, first_name, current_chat_name)
+            msg = await update.message.reply_text(f"✅ Пользователь @{username} удален из администраторов!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
+            menu_messages[user_id] = msg.message_id
+            dialog_messages[user_id] = [msg.message_id]
+        else:
+            msg = await update.message.reply_text(f"❌ Пользователь @{username} не найден в списке администраторов")
+            dialog_messages[user_id].append(msg.message_id)
+        return
+
+    elif action_data.get("action") == "set_cooldown" and is_admin(user_id):
         del awaiting_input[user_id]
         try:
             cooldown = int(user_message)
@@ -1053,12 +1268,13 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
                 for uid in user_limits:
                     user_limits[uid]["cooldown"] = cooldown
                 bot_settings["default_cooldown"] = cooldown
-                await delete_all_menus(user_id, context)
+                await delete_all_messages(user_id, context)
                 first_name = update.effective_user.first_name
                 current_chat_name = user_data[user_id]["current_chat"]["name"]
                 welcome = format_welcome_message(user_id, first_name, current_chat_name)
                 msg = await update.message.reply_text(f"✅ Cooldown для всех установлен: {cooldown} сек\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
             else:
                 msg = await update.message.reply_text("❌ Cooldown должен быть >= 0")
                 dialog_messages[user_id].append(msg.message_id)
@@ -1067,7 +1283,7 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             dialog_messages[user_id].append(msg.message_id)
         return
 
-    elif action_data.get("action") == "set_requests_per_minute" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "set_requests_per_minute" and is_admin(user_id):
         del awaiting_input[user_id]
         try:
             limit = int(user_message)
@@ -1075,12 +1291,13 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
                 for uid in user_limits:
                     user_limits[uid]["requests_per_minute"] = limit
                 bot_settings["default_requests_per_minute"] = limit
-                await delete_all_menus(user_id, context)
+                await delete_all_messages(user_id, context)
                 first_name = update.effective_user.first_name
                 current_chat_name = user_data[user_id]["current_chat"]["name"]
                 welcome = format_welcome_message(user_id, first_name, current_chat_name)
                 msg = await update.message.reply_text(f"✅ Лимит запросов/мин для всех установлен: {limit}\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
             else:
                 msg = await update.message.reply_text("❌ Лимит должен быть >= 0")
                 dialog_messages[user_id].append(msg.message_id)
@@ -1089,19 +1306,20 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             dialog_messages[user_id].append(msg.message_id)
         return
 
-    elif action_data.get("action") == "set_max_chats" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "set_max_chats" and is_admin(user_id):
         del awaiting_input[user_id]
         try:
             limit = int(user_message)
             if limit >= 1:
                 bot_settings["max_chats"] = limit
                 update_bot_settings({"max_chats": limit})
-                await delete_all_menus(user_id, context)
+                await delete_all_messages(user_id, context)
                 first_name = update.effective_user.first_name
                 current_chat_name = user_data[user_id]["current_chat"]["name"]
                 welcome = format_welcome_message(user_id, first_name, current_chat_name)
                 msg = await update.message.reply_text(f"✅ Максимальное количество чатов установлено: {limit}\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
             else:
                 msg = await update.message.reply_text("❌ Лимит должен быть >= 1")
                 dialog_messages[user_id].append(msg.message_id)
@@ -1110,19 +1328,20 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             dialog_messages[user_id].append(msg.message_id)
         return
 
-    elif action_data.get("action") == "set_max_saved" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "set_max_saved" and is_admin(user_id):
         del awaiting_input[user_id]
         try:
             limit = int(user_message)
             if limit >= 1:
                 bot_settings["max_saved_messages"] = limit
                 update_bot_settings({"max_saved_messages": limit})
-                await delete_all_menus(user_id, context)
+                await delete_all_messages(user_id, context)
                 first_name = update.effective_user.first_name
                 current_chat_name = user_data[user_id]["current_chat"]["name"]
                 welcome = format_welcome_message(user_id, first_name, current_chat_name)
                 msg = await update.message.reply_text(f"✅ Максимальное количество сохраненных сообщений установлено: {limit}\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                 menu_messages[user_id] = msg.message_id
+                dialog_messages[user_id] = [msg.message_id]
             else:
                 msg = await update.message.reply_text("❌ Лимит должен быть >= 1")
                 dialog_messages[user_id].append(msg.message_id)
@@ -1131,57 +1350,61 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             dialog_messages[user_id].append(msg.message_id)
         return
 
-    elif action_data.get("action") == "set_welcome_message" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "set_welcome_message" and is_admin(user_id):
         del awaiting_input[user_id]
         bot_settings["welcome_message"] = user_message
-        await delete_all_menus(user_id, context)
+        await delete_all_messages(user_id, context)
         first_name = update.effective_user.first_name
         current_chat_name = user_data[user_id]["current_chat"]["name"]
         welcome = format_welcome_message(user_id, first_name, current_chat_name)
         msg = await update.message.reply_text(f"✅ Приветственное сообщение обновлено!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
         menu_messages[user_id] = msg.message_id
+        dialog_messages[user_id] = [msg.message_id]
         return
 
-    elif action_data.get("action") == "set_custom_greeting" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "set_custom_greeting" and is_admin(user_id):
         del awaiting_input[user_id]
         bot_settings["custom_greeting"] = user_message
-        await delete_all_menus(user_id, context)
+        await delete_all_messages(user_id, context)
         first_name = update.effective_user.first_name
         current_chat_name = user_data[user_id]["current_chat"]["name"]
         welcome = format_welcome_message(user_id, first_name, current_chat_name)
         msg = await update.message.reply_text(f"✅ Кастомное приветствие обновлено!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
         menu_messages[user_id] = msg.message_id
+        dialog_messages[user_id] = [msg.message_id]
         return
 
-    elif action_data.get("action") == "set_custom_info" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "set_custom_info" and is_admin(user_id):
         del awaiting_input[user_id]
         bot_settings["custom_info"] = user_message
-        await delete_all_menus(user_id, context)
+        await delete_all_messages(user_id, context)
         first_name = update.effective_user.first_name
         current_chat_name = user_data[user_id]["current_chat"]["name"]
         welcome = format_welcome_message(user_id, first_name, current_chat_name)
         msg = await update.message.reply_text(f"✅ Кастомная информация обновлена!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
         menu_messages[user_id] = msg.message_id
+        dialog_messages[user_id] = [msg.message_id]
         return
 
-    elif action_data.get("action") == "set_message_style" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "set_message_style_default" and is_admin(user_id):
         del awaiting_input[user_id]
         style = user_message.strip().lower()
         if style in MESSAGE_STYLES:
             bot_settings["message_style"] = style
-            await delete_all_menus(user_id, context)
+            await delete_all_messages(user_id, context)
             first_name = update.effective_user.first_name
             current_chat_name = user_data[user_id]["current_chat"]["name"]
             welcome = format_welcome_message(user_id, first_name, current_chat_name)
-            msg = await update.message.reply_text(f"✅ Стиль сообщения изменен на {MESSAGE_STYLES[style]['name']}!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
+            msg = await update.message.reply_text(f"✅ Стиль сообщения по умолчанию изменен на {MESSAGE_STYLES[style]['name']}!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
             menu_messages[user_id] = msg.message_id
+            dialog_messages[user_id] = [msg.message_id]
         else:
             styles_list = ", ".join([f"'{s}'" for s in MESSAGE_STYLES.keys()])
             msg = await update.message.reply_text(f"❌ Неверный стиль. Доступны: {styles_list}")
             dialog_messages[user_id].append(msg.message_id)
         return
 
-    elif action_data.get("action") == "ban_user" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "ban_user" and is_admin(user_id):
         del awaiting_input[user_id]
         target = user_message.strip()
         try:
@@ -1199,7 +1422,7 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             dialog_messages[user_id].append(msg.message_id)
         return
 
-    elif action_data.get("action") == "unban_user" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "unban_user" and is_admin(user_id):
         del awaiting_input[user_id]
         target = user_message.strip()
         try:
@@ -1215,7 +1438,7 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             dialog_messages[user_id].append(msg.message_id)
         return
 
-    elif action_data.get("action") == "mute_user" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "mute_user" and is_admin(user_id):
         duration = action_data.get("duration", 3600)  # По умолчанию 1 час
         del awaiting_input[user_id]
         target = user_message.strip()
@@ -1240,17 +1463,18 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
             dialog_messages[user_id].append(msg.message_id)
         return
 
-    elif action_data.get("action") == "pause_reason" and user_limits.get(user_id, {}).get("is_owner"):
+    elif action_data.get("action") == "pause_reason" and is_admin(user_id):
         del awaiting_input[user_id]
         set_bot_pause(True, user_message)
-        await delete_all_menus(user_id, context)
+        await delete_all_messages(user_id, context)
         first_name = update.effective_user.first_name
         current_chat_name = user_data[user_id]["current_chat"]["name"]
         welcome = format_welcome_message(user_id, first_name, current_chat_name)
         welcome = f"⏸️ **Бот временно приостановлен**\n\nПричина: {user_message}\n\n{welcome}"
         msg = await update.message.reply_text(welcome, reply_markup=get_main_keyboard(user_id))
         menu_messages[user_id] = msg.message_id
-        await notify_owner(context, f"Бот приостановлен. Причина: {user_message}")
+        dialog_messages[user_id] = [msg.message_id]
+        await notify_admins(context, f"Бот приостановлен. Причина: {user_message}")
         return
 
 # ----------------------------------------------------------------------
@@ -1288,7 +1512,7 @@ async def end_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = update.effective_user.first_name
     
     # Полностью очищаем все сообщения
-    await delete_all_menus(user_id, context)
+    await delete_all_messages(user_id, context)
 
     if user_id in user_data:
         cur = user_data[user_id].get("current_chat")
@@ -1301,7 +1525,7 @@ async def end_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     current_chat_name = user_data[user_id]["current_chat"]["name"] if user_data[user_id]["current_chat"] else "Нет чата"
     
-    # Формируем приветственное сообщение согласно стилю
+    # Формируем приветственное сообщение согласно личному стилю
     welcome = format_welcome_message(user_id, first_name, current_chat_name)
     
     if bot_paused:
@@ -1318,12 +1542,15 @@ async def end_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await update.callback_query.edit_message_text(welcome, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
             menu_messages[user_id] = update.callback_query.message.message_id
+            dialog_messages[user_id] = [update.callback_query.message.message_id]
         except:
             msg = await context.bot.send_message(user_id, welcome, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
             menu_messages[user_id] = msg.message_id
+            dialog_messages[user_id] = [msg.message_id]
     else:
         msg = await context.bot.send_message(user_id, welcome, reply_markup=get_main_keyboard(user_id), parse_mode="Markdown")
         menu_messages[user_id] = msg.message_id
+        dialog_messages[user_id] = [msg.message_id]
 
 # ----------------------------------------------------------------------
 # Показ списка чатов
@@ -1434,6 +1661,71 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Сохранение сообщений
+        if data == "save_bot_response":
+            # Получаем последние сообщения бота
+            bot_messages = []
+            if "recent_messages" in user_data[user_id]:
+                bot_messages = [msg for msg in user_data[user_id]["recent_messages"] if msg["sender"] == "bot"]
+            
+            if bot_messages:
+                # Формируем список сообщений с номерами
+                text = "🤖 **Выберите сообщение бота для сохранения:**\n\n"
+                messages_list = []
+                for i, msg in enumerate(bot_messages[-10:], 1):  # Показываем последние 10
+                    text += f"**{i}.** {msg['text'][:100]}...\n\n"
+                    messages_list.append(msg)
+                
+                # Сохраняем информацию для выбора
+                pending_save[user_id] = {
+                    "type": "bot",
+                    "messages": messages_list
+                }
+                
+                await query.edit_message_text(
+                    text + "\n📝 **Введите номер сообщения:**",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="cancel_save")]]),
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.edit_message_text("❌ Нет сообщений бота для сохранения")
+            return
+
+        if data == "save_user_request":
+            # Получаем последние сообщения пользователя
+            user_messages = []
+            if "recent_messages" in user_data[user_id]:
+                user_messages = [msg for msg in user_data[user_id]["recent_messages"] if msg["sender"] == "user"]
+            
+            if user_messages:
+                # Формируем список сообщений с номерами
+                text = "👤 **Выберите ваше сообщение для сохранения:**\n\n"
+                messages_list = []
+                for i, msg in enumerate(user_messages[-10:], 1):  # Показываем последние 10
+                    text += f"**{i}.** {msg['text'][:100]}...\n\n"
+                    messages_list.append(msg)
+                
+                # Сохраняем информацию для выбора
+                pending_save[user_id] = {
+                    "type": "user",
+                    "messages": messages_list
+                }
+                
+                await query.edit_message_text(
+                    text + "\n📝 **Введите номер сообщения:**",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="cancel_save")]]),
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.edit_message_text("❌ Нет ваших сообщений для сохранения")
+            return
+
+        if data == "cancel_save":
+            if user_id in pending_save:
+                del pending_save[user_id]
+            await query.edit_message_text("❌ Сохранение отменено")
+            return
+
         # Информация
         if data == "show_info":
             uptime_seconds = int(time.time() - bot_start_time)
@@ -1479,6 +1771,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             personal = user_data[user_id].get("personal_limits", {})
             rpm = personal.get("requests_per_minute", DEFAULT_REQUESTS_PER_MINUTE)
             cd = personal.get("cooldown", DEFAULT_COOLDOWN)
+            current_style = user_data[user_id].get("message_style", bot_settings["message_style"])
+            style_name = MESSAGE_STYLES[current_style]["name"]
             
             text = (
                 f"⚙️ **Настройки пользователя**\n\n"
@@ -1489,21 +1783,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Попыток 18+ запросов: {adult_att}\n\n"
                 f"📝 **Ваша приписка к запросам:**\n"
                 f"«{note}»\n\n"
+                f"🎨 **Ваш стиль сообщения:**\n"
+                f"{style_name}\n\n"
                 f"⚡ **Ваши лимиты:**\n"
                 f"• Запросов в минуту: {rpm}\n"
                 f"• Cooldown: {cd} сек\n\n"
                 f"🔧 **Управление:**\n"
                 f"• Нажмите кнопку ниже, чтобы изменить приписку\n"
+                f"• Нажмите кнопку ниже, чтобы изменить стиль сообщения\n"
                 f"• Нажмите кнопку ниже, чтобы изменить лимиты\n"
                 f"• Нажмите кнопку ниже, чтобы просмотреть сохраненные сообщения\n"
             )
             keyboard = [
                 [InlineKeyboardButton("📝 Установить приписку", callback_data="set_custom_note")],
+                [InlineKeyboardButton("🎨 Выбрать стиль", callback_data="choose_message_style")],
                 [InlineKeyboardButton("⚡ Мои лимиты", callback_data="my_limits")],
                 [InlineKeyboardButton("💾 Сохраненные сообщения", callback_data="view_saved")],
                 [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]
             ]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        if data == "choose_message_style":
+            text = "🎨 **Выберите ваш стиль главного сообщения:**\n\n"
+            for style_id, style_info in MESSAGE_STYLES.items():
+                mark = "✅ " if user_data[user_id].get("message_style", bot_settings["message_style"]) == style_id else ""
+                text += f"{mark}{style_info['name']}\n{style_info['template'][:50]}...\n\n"
+            
+            keyboard = []
+            for style_id in MESSAGE_STYLES:
+                keyboard.append([InlineKeyboardButton(f"Установить {MESSAGE_STYLES[style_id]['name']}", callback_data=f"set_user_style_{style_id}")])
+            keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="show_settings")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        if data.startswith("set_user_style_"):
+            style = data.replace("set_user_style_", "")
+            if style in MESSAGE_STYLES:
+                user_data[user_id]["message_style"] = style
+                await query.edit_message_text(f"✅ Ваш стиль сообщения изменен на {MESSAGE_STYLES[style]['name']}", reply_markup=get_main_keyboard(user_id))
+                menu_messages[user_id] = query.message.message_id
             return
 
         if data == "set_custom_note":
@@ -1570,8 +1889,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
 
-        # Панель владельца
-        if data == "owner_panel" and user_limits.get(user_id, {}).get("is_owner"):
+        # Панель администратора
+        if data == "admin_panel" and is_admin(user_id):
             total_requests_today = len([t for t in sum(user_requests.values(), []) if time.time() - t < 86400])
             active_now = len([uid for uid, times in user_requests.items() if times and time.time() - times[-1] < 300])
             banned_cnt = len(banned_users)
@@ -1580,8 +1899,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             violations_cnt = sum(len(v) for v in violations.items())
             pause_status = "⏸️ Приостановлен" if bot_paused else "▶️ Активен"
             
+            admin_list = ", ".join([f"@{admin}" for admin in ADMINS]) if ADMINS else "нет"
+            
             text = (
-                f"👑 **Панель владельца**\n\n"
+                f"👑 **Панель администратора**\n\n"
                 f"📊 **Статистика:**\n"
                 f"• Пользователей: {len(user_data)}\n"
                 f"• Активных сейчас: {active_now}\n"
@@ -1594,256 +1915,66 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Забанено username: {banned_usernames_cnt}\n"
                 f"• В муте: {muted_cnt}\n"
                 f"• Статус: {pause_status}\n\n"
+                f"👥 **Администраторы:**\n"
+                f"{admin_list}\n\n"
                 f"⚙️ **Текущие настройки:**\n"
                 f"• Макс. чатов: {bot_settings['max_chats']}\n"
                 f"• Макс. сохранений: {bot_settings['max_saved_messages']}\n"
                 f"• Cooldown: {bot_settings['default_cooldown']} сек\n"
                 f"• Запросов/мин: {bot_settings['default_requests_per_minute']}\n"
-                f"• Стиль сообщения: {MESSAGE_STYLES[bot_settings['message_style']]['name']}\n\n"
+                f"• Стиль сообщения по умолчанию: {MESSAGE_STYLES[bot_settings['message_style']]['name']}\n\n"
                 f"🔧 **Управление:**\n"
             )
             keyboard = [
-                [InlineKeyboardButton("📝 Текст бота", callback_data="owner_text_settings")],
-                [InlineKeyboardButton("🎨 Стиль сообщения", callback_data="owner_message_style")],
-                [InlineKeyboardButton("⚙️ Глобальные настройки", callback_data="owner_global_settings")],
-                [InlineKeyboardButton("⏱️ Cooldown", callback_data="owner_set_cooldown")],
-                [InlineKeyboardButton("📊 Лимиты запросов", callback_data="owner_set_rpm")],
-                [InlineKeyboardButton("🔨 Управление нарушениями", callback_data="owner_violations")],
-                [InlineKeyboardButton("📊 Активность", callback_data="owner_activity")],
-                [InlineKeyboardButton("⏸️ Управление паузой", callback_data="owner_pause_menu")],
+                [InlineKeyboardButton("👥 Управление админами", callback_data="admin_manage")],
+                [InlineKeyboardButton("📝 Текст бота", callback_data="admin_text_settings")],
+                [InlineKeyboardButton("🎨 Стиль сообщения (по умолч.)", callback_data="admin_message_style")],
+                [InlineKeyboardButton("⚙️ Глобальные настройки", callback_data="admin_global_settings")],
+                [InlineKeyboardButton("⏱️ Cooldown", callback_data="admin_set_cooldown")],
+                [InlineKeyboardButton("📊 Лимиты запросов", callback_data="admin_set_rpm")],
+                [InlineKeyboardButton("🔨 Управление нарушениями", callback_data="admin_violations")],
+                [InlineKeyboardButton("📊 Активность", callback_data="admin_activity")],
+                [InlineKeyboardButton("⏸️ Управление паузой", callback_data="admin_pause_menu")],
                 [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]
             ]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
 
-        if data == "owner_message_style" and user_limits.get(user_id, {}).get("is_owner"):
-            text = "🎨 **Выберите стиль главного сообщения:**\n\n"
-            for style_id, style_info in MESSAGE_STYLES.items():
-                mark = "✅ " if bot_settings['message_style'] == style_id else ""
-                text += f"{mark}{style_info['name']}\n{style_info['template'][:50]}...\n\n"
-            
-            keyboard = []
-            for style_id in MESSAGE_STYLES:
-                keyboard.append([InlineKeyboardButton(f"Установить {MESSAGE_STYLES[style_id]['name']}", callback_data=f"set_style_{style_id}")])
-            keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="owner_panel")])
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-            return
-
-        if data.startswith("set_style_") and user_limits.get(user_id, {}).get("is_owner"):
-            style = data.replace("set_style_", "")
-            if style in MESSAGE_STYLES:
-                bot_settings["message_style"] = style
-                await query.edit_message_text(f"✅ Стиль сообщения изменен на {MESSAGE_STYLES[style]['name']}", reply_markup=get_main_keyboard(user_id))
-                menu_messages[user_id] = query.message.message_id
-            return
-
-        if data == "owner_text_settings" and user_limits.get(user_id, {}).get("is_owner"):
+        # Управление администраторами
+        if data == "admin_manage" and is_admin(user_id):
+            admin_list = "\n".join([f"• @{admin}" for admin in ADMINS]) if ADMINS else "• нет администраторов"
             text = (
-                f"📝 **Настройка текстов бота**\n\n"
-                f"Текущие настройки:\n"
-                f"• Приветствие по умолчанию: {bot_settings['welcome_message'][:50]}...\n"
-                f"• Кастомное приветствие: {'✅' if bot_settings['custom_greeting'] else '❌'}\n"
-                f"• Кастомная информация: {'✅' if bot_settings['custom_info'] else '❌'}\n\n"
-                f"Выберите что изменить:"
+                f"👥 **Управление администраторами**\n\n"
+                f"Текущие администраторы:\n{admin_list}\n\n"
+                f"Главный администратор (владелец) не может быть удален."
             )
             keyboard = [
-                [InlineKeyboardButton("📝 Изменить приветствие", callback_data="set_welcome_message")],
-                [InlineKeyboardButton("✨ Установить кастомное приветствие", callback_data="set_custom_greeting")],
-                [InlineKeyboardButton("ℹ️ Установить кастомную информацию", callback_data="set_custom_info")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="owner_panel")]
+                [InlineKeyboardButton("➕ Добавить администратора", callback_data="admin_add")],
+                [InlineKeyboardButton("➖ Удалить администратора", callback_data="admin_remove")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]
             ]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
 
-        if data == "set_custom_greeting" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "set_custom_greeting"}
+        if data == "admin_add" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "add_admin"}
             await query.edit_message_text(
-                "✨ **Введите кастомное приветствие**\n\n"
-                "Используйте {name} для имени пользователя и {chat} для названия чата.\n"
-                "Например: 'Привет, {name}! Добро пожаловать в {chat}'\n\n"
-                "Если оставить пустым, будет использоваться стандартное приветствие.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_text_settings")]]),
+                "👥 **Введите username пользователя для добавления в администраторы**\n\n"
+                "Например: username или @username",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_manage")]]),
                 parse_mode='Markdown'
             )
             return
 
-        if data == "set_custom_info" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "set_custom_info"}
+        if data == "admin_remove" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "remove_admin"}
             await query.edit_message_text(
-                "ℹ️ **Введите кастомную информацию**\n\n"
-                "Эта информация будет показываться после приветствия.\n"
-                "Например: '📢 Важное объявление: ...'\n\n"
-                "Можно использовать Markdown разметку.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_text_settings")]]),
+                "👥 **Введите username пользователя для удаления из администраторов**\n\n"
+                "Например: username или @username\n\n"
+                "⚠️ Главный администратор (владелец) не может быть удален.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_manage")]]),
                 parse_mode='Markdown'
             )
-            return
-
-        if data == "owner_violations" and user_limits.get(user_id, {}).get("is_owner"):
-            if not violations:
-                text = "📋 **Нет нарушений**"
-            else:
-                text = "📋 **Список нарушителей:**\n\n"
-                for uid, user_violations in list(violations.items())[:10]:  # Показываем последние 10
-                    username = user_data.get(uid, {}).get("username", "нет username")
-                    last_violation = user_violations[-1]
-                    time_str = datetime.fromtimestamp(last_violation["time"]).strftime('%d.%m %H:%M')
-                    text += f"• `{uid}` (@{username}) - {last_violation['reason']} ({time_str})\n"
-                    text += f"  Всего нарушений: {len(user_violations)}\n\n"
-            
-            keyboard = [
-                [InlineKeyboardButton("🔨 Забанить пользователя", callback_data="ban_user_from_violations")],
-                [InlineKeyboardButton("🔇 Замутить пользователя", callback_data="mute_user_from_violations")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="owner_panel")]
-            ]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-            return
-
-        if data == "ban_user_from_violations" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "ban_user"}
-            await query.edit_message_text(
-                "🔨 **Введите ID или @username пользователя для бана:**",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_violations")]]),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "mute_user_from_violations" and user_limits.get(user_id, {}).get("is_owner"):
-            # Сначала спрашиваем длительность
-            keyboard = [
-                [InlineKeyboardButton("⏱️ 1 час", callback_data="mute_duration_3600")],
-                [InlineKeyboardButton("⏱️ 6 часов", callback_data="mute_duration_21600")],
-                [InlineKeyboardButton("⏱️ 24 часа", callback_data="mute_duration_86400")],
-                [InlineKeyboardButton("⏱️ 7 дней", callback_data="mute_duration_604800")],
-                [InlineKeyboardButton("◀️ Отмена", callback_data="owner_violations")]
-            ]
-            await query.edit_message_text(
-                "🔇 **Выберите длительность мута:**",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data.startswith("mute_duration_") and user_limits.get(user_id, {}).get("is_owner"):
-            duration = int(data.replace("mute_duration_", ""))
-            awaiting_input[user_id] = {"action": "mute_user", "duration": duration}
-            await query.edit_message_text(
-                f"🔇 **Введите ID или @username пользователя для мута на {duration//3600} часов:**",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_violations")]]),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "owner_global_settings" and user_limits.get(user_id, {}).get("is_owner"):
-            keyboard = [
-                [InlineKeyboardButton("📁 Макс. чатов", callback_data="owner_set_max_chats")],
-                [InlineKeyboardButton("💾 Макс. сохранений", callback_data="owner_set_max_saved")],
-                [InlineKeyboardButton("📝 Приветствие", callback_data="set_welcome_message")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="owner_panel")]
-            ]
-            await query.edit_message_text(
-                "⚙️ **Глобальные настройки**",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "set_welcome_message" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "set_welcome_message"}
-            await query.edit_message_text(
-                "📝 **Введите новое приветственное сообщение по умолчанию**\n\n"
-                "Используйте {name} и {chat}.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_global_settings")]]),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "owner_set_max_chats" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "set_max_chats"}
-            await query.edit_message_text(
-                "📁 **Введите максимальное количество постоянных чатов** (целое число >=1):",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_global_settings")]]),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "owner_set_max_saved" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "set_max_saved"}
-            await query.edit_message_text(
-                "💾 **Введите максимальное количество сохраняемых сообщений** (целое число >=1):",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_global_settings")]]),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "owner_set_cooldown" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "set_cooldown"}
-            await query.edit_message_text(
-                "⏱️ **Введите cooldown между запросами (сек)** (>=0):",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_panel")]]),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "owner_set_rpm" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "set_requests_per_minute"}
-            await query.edit_message_text(
-                "📊 **Введите лимит запросов в минуту** (>=0):",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_panel")]]),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "owner_activity" and user_limits.get(user_id, {}).get("is_owner"):
-            today = datetime.now().strftime('%Y-%m-%d')
-            week = datetime.now().strftime('%Y-%W')
-            month = datetime.now().strftime('%Y-%m')
-            da = len(daily_active_users)
-            wa = len(weekly_active_users)
-            ma = len(monthly_active_users)
-            text = (
-                f"📊 **Активность пользователей**\n\n"
-                f"• Активных сегодня: {da}\n"
-                f"• Активных на этой неделе: {wa}\n"
-                f"• Активных в этом месяце: {ma}\n\n"
-                f"Детальная статистика по дням доступна в логах."
-            )
-            keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="owner_panel")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-            return
-
-        if data == "owner_pause_menu" and user_limits.get(user_id, {}).get("is_owner"):
-            status = "⏸️ Приостановлен" if bot_paused else "▶️ Активен"
-            reason = f"\nПричина: {pause_reason}" if bot_paused else ""
-            keyboard = [
-                [InlineKeyboardButton("⏸️ Приостановить", callback_data="owner_pause")],
-                [InlineKeyboardButton("▶️ Возобновить", callback_data="owner_resume")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="owner_panel")]
-            ]
-            await query.edit_message_text(
-                f"⏸️ **Управление паузой бота**\n\nТекущий статус: {status}{reason}",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "owner_pause" and user_limits.get(user_id, {}).get("is_owner"):
-            awaiting_input[user_id] = {"action": "pause_reason"}
-            await query.edit_message_text(
-                "⏸️ **Введите причину приостановки бота:**",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="owner_pause_menu")]]),
-                parse_mode='Markdown'
-            )
-            return
-
-        if data == "owner_resume" and user_limits.get(user_id, {}).get("is_owner"):
-            set_bot_pause(False)
-            await query.edit_message_text(
-                "▶️ **Бот возобновлен!**",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="owner_panel")]]),
-                parse_mode='Markdown'
-            )
-            await notify_owner(context, "Бот возобновлен.")
             return
 
         # Режимы и модели
@@ -1904,8 +2035,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text += f"**{i+1}.** {emoji} {m['content'][:100]}\n\n"
                 else:
                     text = f"📭 **История чата: {chat['name']}**\n\nНет сообщений."
-                keyboard = [[InlineKeyboardButton("◀️ Назад к чатам", callback_data="show_chats")]]
+                keyboard = [
+                    [InlineKeyboardButton("🗑 Удалить чат", callback_data=f"delete_chat_{chat_id}")],
+                    [InlineKeyboardButton("◀️ Назад к чатам", callback_data="show_chats")]
+                ]
                 await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        if data.startswith("delete_chat_"):
+            chat_id = data.replace("delete_chat_", "")
+            chat_name = "Неизвестный чат"
+            # Находим имя чата для сообщения
+            if user_data[user_id]["temp_chat"] and user_data[user_id]["temp_chat"]["id"] == chat_id:
+                chat_name = user_data[user_id]["temp_chat"]["name"]
+            else:
+                for chat in user_data[user_id]["chats"]:
+                    if chat["id"] == chat_id:
+                        chat_name = chat["name"]
+                        break
+            
+            if delete_chat(user_id, chat_id):
+                await query.edit_message_text(f"✅ Чат '{chat_name}' успешно удален!", reply_markup=get_main_keyboard(user_id))
+                menu_messages[user_id] = query.message.message_id
+            else:
+                await query.edit_message_text("❌ Не удалось удалить чат", reply_markup=get_main_keyboard(user_id))
             return
 
         if data == "new_permanent_chat":
@@ -1960,12 +2113,243 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 del awaiting_input[user_id]
                 chat_id, error = create_chat(user_id, name, is_temporary=True)
                 if chat_id:
-                    await delete_all_menus(user_id, context)
+                    await delete_all_messages(user_id, context)
                     first_name = update.effective_user.first_name
                     current_chat_name = user_data[user_id]["current_chat"]["name"]
                     welcome = format_welcome_message(user_id, first_name, current_chat_name)
                     msg = await context.bot.send_message(user_id, f"✅ Временный чат '{name}' создан!\n\n{welcome}", reply_markup=get_main_keyboard(user_id))
                     menu_messages[user_id] = msg.message_id
+                    dialog_messages[user_id] = [msg.message_id]
+            return
+
+        # Обработчики панели администратора
+        if data == "admin_message_style" and is_admin(user_id):
+            text = "🎨 **Выберите стиль главного сообщения по умолчанию:**\n\n"
+            for style_id, style_info in MESSAGE_STYLES.items():
+                mark = "✅ " if bot_settings['message_style'] == style_id else ""
+                text += f"{mark}{style_info['name']}\n{style_info['template'][:50]}...\n\n"
+            
+            keyboard = []
+            for style_id in MESSAGE_STYLES:
+                keyboard.append([InlineKeyboardButton(f"Установить {MESSAGE_STYLES[style_id]['name']}", callback_data=f"set_default_style_{style_id}")])
+            keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        if data.startswith("set_default_style_") and is_admin(user_id):
+            style = data.replace("set_default_style_", "")
+            if style in MESSAGE_STYLES:
+                bot_settings["message_style"] = style
+                await query.edit_message_text(f"✅ Стиль сообщения по умолчанию изменен на {MESSAGE_STYLES[style]['name']}", reply_markup=get_main_keyboard(user_id))
+                menu_messages[user_id] = query.message.message_id
+            return
+
+        if data == "admin_text_settings" and is_admin(user_id):
+            text = (
+                f"📝 **Настройка текстов бота**\n\n"
+                f"Текущие настройки:\n"
+                f"• Приветствие по умолчанию: {bot_settings['welcome_message'][:50]}...\n"
+                f"• Кастомное приветствие: {'✅' if bot_settings['custom_greeting'] else '❌'}\n"
+                f"• Кастомная информация: {'✅' if bot_settings['custom_info'] else '❌'}\n\n"
+                f"Выберите что изменить:"
+            )
+            keyboard = [
+                [InlineKeyboardButton("📝 Изменить приветствие по умолч.", callback_data="set_welcome_message")],
+                [InlineKeyboardButton("✨ Установить кастомное приветствие", callback_data="set_custom_greeting")],
+                [InlineKeyboardButton("ℹ️ Установить кастомную информацию", callback_data="set_custom_info")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]
+            ]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        if data == "admin_global_settings" and is_admin(user_id):
+            keyboard = [
+                [InlineKeyboardButton("📁 Макс. чатов", callback_data="admin_set_max_chats")],
+                [InlineKeyboardButton("💾 Макс. сохранений", callback_data="admin_set_max_saved")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]
+            ]
+            await query.edit_message_text(
+                "⚙️ **Глобальные настройки**",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "admin_set_cooldown" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "set_cooldown"}
+            await query.edit_message_text(
+                "⏱️ **Введите cooldown между запросами (сек)** (>=0):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_panel")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "admin_set_rpm" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "set_requests_per_minute"}
+            await query.edit_message_text(
+                "📊 **Введите лимит запросов в минуту** (>=0):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_panel")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "admin_set_max_chats" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "set_max_chats"}
+            await query.edit_message_text(
+                "📁 **Введите максимальное количество постоянных чатов** (целое число >=1):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_global_settings")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "admin_set_max_saved" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "set_max_saved"}
+            await query.edit_message_text(
+                "💾 **Введите максимальное количество сохраняемых сообщений** (целое число >=1):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_global_settings")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "admin_violations" and is_admin(user_id):
+            if not violations:
+                text = "📋 **Нет нарушений**"
+            else:
+                text = "📋 **Список нарушителей:**\n\n"
+                for uid, user_violations in list(violations.items())[:10]:  # Показываем последние 10
+                    username = user_data.get(uid, {}).get("username", "нет username")
+                    last_violation = user_violations[-1]
+                    time_str = datetime.fromtimestamp(last_violation["time"]).strftime('%d.%m %H:%M')
+                    text += f"• `{uid}` (@{username}) - {last_violation['reason']} ({time_str})\n"
+                    text += f"  Всего нарушений: {len(user_violations)}\n\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔨 Забанить пользователя", callback_data="ban_user_from_violations")],
+                [InlineKeyboardButton("🔇 Замутить пользователя", callback_data="mute_user_from_violations")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]
+            ]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        if data == "admin_activity" and is_admin(user_id):
+            today = datetime.now().strftime('%Y-%m-%d')
+            week = datetime.now().strftime('%Y-%W')
+            month = datetime.now().strftime('%Y-%m')
+            da = len(daily_active_users)
+            wa = len(weekly_active_users)
+            ma = len(monthly_active_users)
+            text = (
+                f"📊 **Активность пользователей**\n\n"
+                f"• Активных сегодня: {da}\n"
+                f"• Активных на этой неделе: {wa}\n"
+                f"• Активных в этом месяце: {ma}\n\n"
+                f"Детальная статистика по дням доступна в логах."
+            )
+            keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+
+        if data == "admin_pause_menu" and is_admin(user_id):
+            status = "⏸️ Приостановлен" if bot_paused else "▶️ Активен"
+            reason = f"\nПричина: {pause_reason}" if bot_paused else ""
+            keyboard = [
+                [InlineKeyboardButton("⏸️ Приостановить", callback_data="admin_pause")],
+                [InlineKeyboardButton("▶️ Возобновить", callback_data="admin_resume")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]
+            ]
+            await query.edit_message_text(
+                f"⏸️ **Управление паузой бота**\n\nТекущий статус: {status}{reason}",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "admin_pause" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "pause_reason"}
+            await query.edit_message_text(
+                "⏸️ **Введите причину приостановки бота:**",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_pause_menu")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "admin_resume" and is_admin(user_id):
+            set_bot_pause(False)
+            await query.edit_message_text(
+                "▶️ **Бот возобновлен!**",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")]]),
+                parse_mode='Markdown'
+            )
+            await notify_admins(context, "Бот возобновлен.")
+            return
+
+        if data == "set_welcome_message" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "set_welcome_message"}
+            await query.edit_message_text(
+                "📝 **Введите новое приветственное сообщение по умолчанию**\n\n"
+                "Используйте {name} и {chat}.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_text_settings")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "set_custom_greeting" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "set_custom_greeting"}
+            await query.edit_message_text(
+                "✨ **Введите кастомное приветствие**\n\n"
+                "Используйте {name} для имени пользователя и {chat} для названия чата.\n"
+                "Например: 'Привет, {name}! Добро пожаловать в {chat}'\n\n"
+                "Если оставить пустым, будет использоваться стандартное приветствие.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_text_settings")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "set_custom_info" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "set_custom_info"}
+            await query.edit_message_text(
+                "ℹ️ **Введите кастомную информацию**\n\n"
+                "Эта информация будет показываться после приветствия.\n"
+                "Например: '📢 Важное объявление: ...'\n\n"
+                "Можно использовать Markdown разметку.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_text_settings")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "ban_user_from_violations" and is_admin(user_id):
+            awaiting_input[user_id] = {"action": "ban_user"}
+            await query.edit_message_text(
+                "🔨 **Введите ID или @username пользователя для бана:**",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_violations")]]),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data == "mute_user_from_violations" and is_admin(user_id):
+            # Сначала спрашиваем длительность
+            keyboard = [
+                [InlineKeyboardButton("⏱️ 1 час", callback_data="mute_duration_3600")],
+                [InlineKeyboardButton("⏱️ 6 часов", callback_data="mute_duration_21600")],
+                [InlineKeyboardButton("⏱️ 24 часа", callback_data="mute_duration_86400")],
+                [InlineKeyboardButton("⏱️ 7 дней", callback_data="mute_duration_604800")],
+                [InlineKeyboardButton("◀️ Отмена", callback_data="admin_violations")]
+            ]
+            await query.edit_message_text(
+                "🔇 **Выберите длительность мута:**",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            return
+
+        if data.startswith("mute_duration_") and is_admin(user_id):
+            duration = int(data.replace("mute_duration_", ""))
+            awaiting_input[user_id] = {"action": "mute_user", "duration": duration}
+            await query.edit_message_text(
+                f"🔇 **Введите ID или @username пользователя для мута на {duration//3600} часов:**",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_violations")]]),
+                parse_mode='Markdown'
+            )
             return
 
     except Exception as e:
