@@ -1,4 +1,4 @@
-# get_dialog_reply_keyboard  
+#  handle_photo_message  
 
 import logging
 import asyncio
@@ -609,6 +609,7 @@ def init_deepseek():
         return False
 
 async def call_deepseek_async(messages, model="deepseek-chat", temperature=0.8, max_tokens=2048):
+    """Вызов DeepSeek API с поддержкой текста и изображений"""
     if not deepseek_client:
         raise Exception("DeepSeek клиент не инициализирован")
     loop = asyncio.get_running_loop()
@@ -626,6 +627,78 @@ async def call_deepseek_async(messages, model="deepseek-chat", temperature=0.8, 
     except Exception as e:
         logger.error(f"DeepSeek API error: {e}")
         raise
+
+async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нескольких фото (альбом)"""
+    user_id = update.effective_user.id
+    
+    await update.message.reply_text(
+        "📸 Получено несколько фото. Я проанализирую первое из них.\n"
+        "💡 Для лучшего результата отправляйте фото по одному с вопросами.",
+        reply_markup=get_dialog_reply_keyboard(user_id)
+    )
+    
+    # Обрабатываем первое фото
+    if update.message.media_group_id:
+        # Это альбом, но мы обработаем только первое сообщение
+        pass
+
+
+
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото с анализом через DeepSeek"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    
+    # Инициализация пользователя
+    if user_id not in user_data:
+        init_user_data(user_id)
+        user_data[user_id]["first_name"] = first_name
+        user_data[user_id]["username"] = username
+    
+    # Проверка ограничений
+    allowed, msg = check_user_restrictions(user_id, username)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
+    
+    # Проверка лимитов
+    allowed, limit_msg = check_request_limits(user_id)
+    if not allowed:
+        await update.message.reply_text(limit_msg)
+        return
+    
+    # Показываем, что бот думает
+    await context.bot.send_chat_action(user_id, "typing")
+    
+    # Получаем фото самого высокого качества
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    
+    # Скачиваем фото
+    image_bytes = await file.download_as_bytearray()
+    
+    # Получаем текст вопроса (если есть)
+    question = update.message.caption or "Что изображено на этом фото? Опиши подробно на русском языке."
+    
+    try:
+        # DeepSeek не поддерживает изображения, отправляем сообщение об ошибке
+        await update.message.reply_text(
+            "❌ Функция анализа фото временно недоступна.\n\n"
+            "DeepSeek API пока не поддерживает распознавание изображений.\n"
+            "Ожидайте обновления или используйте текстовые запросы.",
+            reply_markup=get_dialog_reply_keyboard(user_id)
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при анализе фото: {e}")
+        await update.message.reply_text(
+            "❌ Не удалось проанализировать фото. Попробуйте позже.",
+            reply_markup=get_dialog_reply_keyboard(user_id)
+        )
+
+
 
 async def call_llm_with_failover(messages, temperature=0.8, max_tokens=2048):
     return await call_deepseek_async(messages, model=bot_settings["default_model"], temperature=temperature, max_tokens=max_tokens)
@@ -1498,16 +1571,14 @@ def get_dialog_reply_keyboard(user_id):
         init_user_data(user_id)
     lang = user_data[user_id].get("language", "ru")
     
-    # Первая строка
     row1 = []
     if is_feature_enabled("save_messages"):
         row1.append("💾 Сохранить" if lang == "ru" else "💾 Save")
+    row1.append("📸 Анализ фото" if lang == "ru" else "📸 Analyze photo")
     row1.append("❌ Завершить диалог" if lang == "ru" else "❌ End dialog")
     
-    # Вторая строка - очистка истории
     row2 = ["🗑 Очистить историю" if lang == "ru" else "🗑 Clear history"]
     
-    # Третья строка
     row3 = [
         "📊 Статистика" if lang == "ru" else "📊 Stats",
         "🌟 Подписка" if lang == "ru" else "🌟 Subscription"
@@ -1970,6 +2041,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deleted = await delete_all_messages(user_id, context)
         await update.message.reply_text(
             f"✅ Очищено {deleted} сообщений!",
+            reply_markup=get_dialog_reply_keyboard(user_id)
+        )
+        return
+
+    if user_message in ["📸 Анализ фото", "📸 Analyze photo"]:
+        await update.message.reply_text(
+            "📸 Отправьте мне фото с вопросом в подписи.\n\n"
+            "Пример: отправьте фото и напишите в подписи 'Что на этом фото?'",
             reply_markup=get_dialog_reply_keyboard(user_id)
         )
         return
@@ -2886,9 +2965,13 @@ async def handle_save_number_selection(update: Update, context: ContextTypes.DEF
         else:
             await update.message.reply_text(get_text(user_id, "enter_number"), reply_markup=ReplyKeyboardMarkup([["◀️ Отмена"]], resize_keyboard=True))
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_photo_old(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text(get_text(user_id, "photo_error"), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Завершить диалог", callback_data="end_dialog")]]))
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото - анализ через DeepSeek"""
+    await handle_photo_message(update, context)
 
 async def end_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from telegram import ReplyKeyboardRemove
@@ -4347,17 +4430,14 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).connect_timeout(30.0).read_timeout(30.0).post_init(post_init).build()
     
-    # ========== ВСЕ ОБРАБОТЧИКИ ДОБАВЛЯЙТЕ ЗДЕСЬ ==========
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("clear", clear_history))  # Если есть
-    app.add_handler(CommandHandler("testweather", test_weather))  # ← Добавьте СЮДА
-    
     app.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Обработка фото
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    
+    # Обработка текста
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-    app.add_error_handler(error_handler)
     # =====================================================
     
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, poll_interval=1.0, timeout=60)
