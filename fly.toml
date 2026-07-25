@@ -1,0 +1,46 @@
+# fly.toml - конфигурация для fly.io
+app = "dcheck-bot"  # ЗАМЕНИТЕ НА УНИКАЛЬНОЕ ИМЯ
+
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[build]
+  [build.args]
+    PYTHON_VERSION = "3.10"
+
+[env]
+  PORT = "8080"
+  DATA_DIR = "/app/data"
+
+# Монтируем том для постоянного хранения
+[mounts]
+  source = "data"
+  destination = "/app/data"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+
+  [services.concurrency]
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  # Health check для fly.io
+  [[services.tcp_checks]]
+    interval = 15000
+    timeout = 2000
+    grace_period = "30s"
+
+  [[services.http_checks]]
+    path = "/ping"
+    interval = 10000
+    timeout = 2000
+    grace_period = "30s"
