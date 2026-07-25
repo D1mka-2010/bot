@@ -2330,8 +2330,37 @@ def set_typing_speed_handler(call):
     bot.answer_callback_query(call.id, f"✅ Скорость установлена: {speed} символов/сек", show_alert=True)
     typing_speed_menu(call)
 
-# ===================== ЗАПУСК =====================
-if __name__ == "__main__":
+# ===================== ВЕБ-СЕРВЕР ДЛЯ FLY.IO =====================
+from flask import Flask, jsonify
+import threading
+
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def health_check():
+    return jsonify({
+        "status": "online",
+        "bot": "d.Check",
+        "users": get_total_users(),
+        "active_clients": len(active_clients),
+        "uptime": get_bot_uptime()
+    })
+
+@web_app.route('/ping')
+def ping():
+    return "pong", 200
+
+def run_web():
+    port = int(os.environ.get('PORT', 8080))
+    web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+# Запускаем веб-сервер в отдельном потоке
+web_thread = threading.Thread(target=run_web, daemon=True)
+web_thread.start()
+print(f"✅ Веб-сервер для health checks запущен на порту {os.environ.get('PORT', 8080)}")
+
+# ===================== ЗАПУСК БОТА =====================
+def run_bot():
     print("=" * 50)
     print("🤖 БОТ d.Check ЗАПУЩЕН")
     if 0 in ADMIN_LIST:
@@ -2355,3 +2384,7 @@ if __name__ == "__main__":
     finally:
         for uid in list(active_clients.keys()):
             stop_userbot(uid)
+
+if __name__ == "__main__":
+    # Запускаем бота в основном потоке (он блокирующий)
+    run_bot()
