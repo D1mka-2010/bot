@@ -21,7 +21,7 @@ import traceback
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
 # ===================== НАСТРОЙКИ =====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8817363723:AAH248lhECJRhIE80CXBVSfe-JwXQrm-37A")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8817363723:AAGJQG38Pyd7caE9f4LWrpBwy-A44O5kDK0")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-5e32f44e18f04897a8a4b1f94b52f482")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
