@@ -17,4 +17,4 @@ RUN mkdir -p /app/data
 EXPOSE 8080
 
 # Запускаем бота
-CMD ["python", "bot.py"]
+CMD ["python", "main.py"]
